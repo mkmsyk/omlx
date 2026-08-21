@@ -2357,6 +2357,51 @@ class TestTwoWatermarkPressureLevels:
         mock_engine_pool._unload_engine.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_soft_pressure_shrinks_hot_cache_before_evicting(
+        self, mock_engine_pool
+    ):
+        """Soft pressure walks the non-destructive ladder instead of going
+        straight to model eviction — with two models resident the soft
+        overshoot is typically far smaller than the shared hot cache."""
+        budget = MagicMock()
+        budget.total_bytes = 20 * 1024**3
+        budget.max_bytes = 20 * 1024**3
+        budget.shrink_to.return_value = 8 * 1024**3
+        mock_engine_pool._scheduler_config = SimpleNamespace(hot_cache_budget=budget)
+        enforcer = _make_enforcer(
+            mock_engine_pool,
+            ceiling=100 * 1024**3,
+            soft_threshold=0.90,
+            hard_threshold=0.95,
+        )
+        to_thread_calls = []
+
+        async def run_inline(fn, *args, **kwargs):
+            to_thread_calls.append((fn, args, kwargs))
+            return fn(*args, **kwargs)
+
+        with (
+            patch.object(
+                enforcer,
+                "_current_usage_bytes",
+                side_effect=[92 * 1024**3, 85 * 1024**3],
+            ),
+            patch(
+                "omlx.process_memory_enforcer.asyncio.to_thread",
+                side_effect=run_inline,
+            ),
+        ):
+            await enforcer._check_and_enforce()
+
+        assert to_thread_calls
+        assert to_thread_calls[0][0] == enforcer._shrink_hot_cache_for_pressure
+        budget.shrink_to.assert_called_once()
+        target_hot = budget.shrink_to.call_args.args[0]
+        assert target_hot == 18 * 1024**3
+        assert enforcer._pressure_level == "ok"
+        mock_engine_pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_propagates_admission_paused_on_soft(self, enforcer_2wm, pool):
         # Wire a scheduler-like mock so propagate has something to set.
         engine = MagicMock()

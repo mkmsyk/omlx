@@ -1458,10 +1458,12 @@ class ProcessMemoryEnforcer:
         else:
             new_level = "hard"
 
-        if new_level != "hard":
-            # The hard episode ended (drain worked or the load finished):
+        if new_level == "ok":
+            # The pressure episode ended (drain worked or the load finished):
             # the next one gets a fresh reclaim-grace budget. Must happen
-            # before the ok-level early return below.
+            # before the ok-level early return below. Soft shares the reclaim
+            # ladder below, so the budget has to survive a hard -> soft
+            # transition instead of resetting on every soft poll.
             self._pressure_reclaim_grace_polls = 0
 
         if new_level != prev_level:
@@ -1474,7 +1476,14 @@ class ProcessMemoryEnforcer:
                 f"ceiling={_format_gb(ceiling)})"
             )
 
-        if new_level == "hard":
+        if new_level in ("soft", "hard"):
+            # Soft pressure used to skip this ladder and go straight to model
+            # eviction while up to hot_cache_max_size of shared hot cache sat
+            # unreclaimed; with two models resident the soft overshoot is
+            # typically far smaller than the cache, so a whole model was
+            # unloaded to recover ~1GB. Both levels now try the
+            # non-destructive ladder (pooled-Metal reclaim, hot-cache shrink)
+            # before any eviction.
             # When pooled Metal buffers can be returned at the next inference
             # boundary, let that non-destructive reclaim run before shrinking
             # shared hot cache or aborting work.  A failed / unavailable request
@@ -1490,9 +1499,10 @@ class ProcessMemoryEnforcer:
                 if requested:
                     self._pressure_reclaim_grace_polls += 1
                     logger.info(
-                        "Hard memory pressure: deferring destructive enforcement "
+                        "%s memory pressure: deferring destructive enforcement "
                         "(poll %d/%d) while pooled Metal buffers drain on %d "
                         "scheduler(s)",
+                        new_level.capitalize(),
                         self._pressure_reclaim_grace_polls,
                         self._PRESSURE_RECLAIM_GRACE_POLLS_MAX,
                         requested,
