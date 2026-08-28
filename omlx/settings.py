@@ -961,6 +961,13 @@ class GlobalSettings:
     idle_timeout: ModelIdleTimeoutSettings = field(
         default_factory=ModelIdleTimeoutSettings
     )
+    # Keep the scheduler concurrency key out of settings.json when it was
+    # never explicitly configured. The runtime still uses SchedulerSettings'
+    # default (8); this only prevents a CLI override for an unrelated setting
+    # from materializing a global tuning value on every startup.
+    _persist_scheduler_concurrency: bool = field(
+        default=False, init=False, repr=False, compare=False
+    )
 
     @classmethod
     def load(
@@ -1014,6 +1021,16 @@ class GlobalSettings:
         try:
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
+
+            scheduler_data = data.get("scheduler") or {}
+            self._persist_scheduler_concurrency = any(
+                key in scheduler_data
+                for key in (
+                    "max_concurrent_requests",
+                    "max_num_seqs",
+                    "completion_batch_size",
+                )
+            )
 
             # Check version for future migrations
             version = data.get("version", "1.0")
@@ -1253,6 +1270,7 @@ class GlobalSettings:
             and args.max_concurrent_requests is not None
         ):
             self.scheduler.max_concurrent_requests = args.max_concurrent_requests
+            self._persist_scheduler_concurrency = True
         if (
             hasattr(args, "embedding_batch_size")
             and args.embedding_batch_size is not None
@@ -1398,6 +1416,8 @@ class GlobalSettings:
             "ui": self.ui.to_dict(),
             "idle_timeout": self.idle_timeout.to_dict(),
         }
+        if not self._persist_scheduler_concurrency and self.scheduler.max_concurrent_requests == 8:
+            data["scheduler"].pop("max_concurrent_requests", None)
 
         # Write to a temp file and rename so a crash or a concurrent
         # writer can never leave a torn settings.json (same pattern as

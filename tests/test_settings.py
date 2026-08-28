@@ -783,6 +783,27 @@ class TestMCPSettings:
         if os.name == "posix":
             assert (settings_file.stat().st_mode & 0o777) == 0o600
 
+    def test_save_does_not_materialize_default_scheduler_concurrency(self, tmp_path):
+        """An unrelated CLI save must not persist the scheduler's default 8."""
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.save()
+        stored = json.loads((tmp_path / "settings.json").read_text())
+        assert "max_concurrent_requests" not in stored["scheduler"]
+
+        restored = GlobalSettings.load(base_path=tmp_path)
+        assert restored.scheduler.max_concurrent_requests == 8
+        restored.save()
+        stored = json.loads((tmp_path / "settings.json").read_text())
+        assert "max_concurrent_requests" not in stored["scheduler"]
+
+    def test_save_preserves_explicit_scheduler_concurrency(self, tmp_path):
+        """An explicitly selected non-default concurrency remains persistent."""
+        settings = GlobalSettings(base_path=tmp_path)
+        settings.scheduler.max_concurrent_requests = 4
+        settings.save()
+        stored = json.loads((tmp_path / "settings.json").read_text())
+        assert stored["scheduler"]["max_concurrent_requests"] == 4
+
     def test_global_settings_corrupt_file_is_moved_aside(self, tmp_path):
         """A corrupt settings.json is preserved as evidence, not silently eaten."""
         settings_file = tmp_path / "settings.json"
