@@ -7,6 +7,7 @@ import json
 import re
 from typing import Any
 
+from ..api.thinking import LiteralThinkTagGuard
 from ..api.utils import _PRESERVE_BOUNDARY_KEY
 from ..utils.tokenizer import create_streaming_detokenizer
 from .output_parser import OutputParserFinalizeResult, OutputParserTokenResult
@@ -309,6 +310,11 @@ class Gemma4OutputParserSession:
         self._buffer = ""
         self._in_thought = False
         self._text_mode = False
+        # The real reasoning boundary is the ``<channel|>`` protocol token.
+        # A ``</think>`` spelled out inside the thought body (the model
+        # quoting the tag) is ordinary text and must not close the block
+        # downstream, so every text segment is passed through the guard.
+        self._tag_guard = LiteralThinkTagGuard("gemma4")
 
         self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
         if self._detokenizer is not None:
@@ -332,8 +338,20 @@ class Gemma4OutputParserSession:
     ) -> None:
         if not text:
             return
+        text = self._tag_guard.feed(text)
+        if not text:
+            return
         stream_parts.append(text)
         visible_parts.append(text)
+
+    def _flush_guard(
+        self, stream_parts: list[str], visible_parts: list[str]
+    ) -> None:
+        """Emit text the guard held back, ahead of a real boundary marker."""
+        held = self._tag_guard.flush()
+        if held:
+            stream_parts.append(held)
+            visible_parts.append(held)
 
     def _active_markers(self) -> list[str]:
         # Channel open/close are tracked unconditionally so a stray
@@ -417,6 +435,9 @@ class Gemma4OutputParserSession:
                     )
 
             self._append_text(stream_parts, visible_parts, source[pos:idx])
+            # A protocol marker is the real boundary: release anything the
+            # guard was holding so the ``<think>`` markers land after it.
+            self._flush_guard(stream_parts, visible_parts)
 
             advance = len(marker)
 
@@ -497,6 +518,11 @@ class Gemma4OutputParserSession:
             stream_text += self._buffer
             visible_text += self._buffer
             self._buffer = ""
+
+        held = self._tag_guard.flush()
+        if held:
+            stream_text += held
+            visible_text += held
 
         if self._in_thought:
             stream_text += _THINK_CLOSE

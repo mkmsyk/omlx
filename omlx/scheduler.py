@@ -2208,6 +2208,10 @@ class Scheduler:
         self._request_detokenizers: dict[str, Any] = (
             {}
         )  # request_id → active detokenizer
+        # Literal think-tag guards for the plain (non-parser) decode path:
+        # request_id → LiteralThinkTagGuard. See omlx.api.thinking.
+        self._literal_tag_guards: dict[str, Any] = {}
+        self._literal_tag_marker_ids_cache: tuple[int, ...] | None = None
 
         # Protocol-specific output parser support (e.g. Harmony, Gemma 4)
         self._output_parser_factory: OutputParserFactory | None = None
@@ -3002,7 +3006,46 @@ class Scheduler:
         to prevent state contamination that causes text corruption.
         """
         self._request_detokenizers.pop(request_id, None)
+        self._literal_tag_guards.pop(request_id, None)
         # Let GC collect - no pooling to prevent state contamination
+
+    def _literal_think_marker_ids(self) -> tuple[int, ...]:
+        """Token ids that legitimately render as think markers.
+
+        Used by the plain decode path to tell the model's real boundary
+        token from a ``</think>`` it merely spelled out as text. Only models
+        whose close-think marker is a single token qualify: when the marker
+        itself is a multi-token spelling there is nothing to distinguish.
+        Protocol-parser models handle this inside their parser session.
+        """
+        cached = self._literal_tag_marker_ids_cache
+        if cached is not None:
+            return cached
+        ids: list[int] = []
+        if self._output_parser_factory is None:
+            try:
+                end_ids = self._resolve_think_end_token_ids()
+            except Exception:
+                end_ids = None
+            if end_ids and len(end_ids) == 1:
+                ids.append(int(end_ids[0]))
+                start_id = self._get_think_token_id("think_start_id")
+                if start_id is not None:
+                    try:
+                        ids.append(int(start_id))
+                    except (TypeError, ValueError):
+                        pass
+        self._literal_tag_marker_ids_cache = tuple(ids)
+        return self._literal_tag_marker_ids_cache
+
+    def _get_literal_tag_guard(self, request_id: str):
+        guard = self._literal_tag_guards.get(request_id)
+        if guard is None:
+            from .api.thinking import LiteralThinkTagGuard
+
+            guard = LiteralThinkTagGuard("scheduler")
+            self._literal_tag_guards[request_id] = guard
+        return guard
 
     def _get_output_parser_session(
         self, request_id: str
@@ -10961,6 +11004,18 @@ class Scheduler:
                             new_text = ""
                         break
 
+                # Boundary robustness: only the model's think marker token
+                # is a real boundary. A ``</think>`` the model spells out
+                # from ordinary tokens (quoting the tag) is guarded so the
+                # API-layer text parser keeps it inside the current block.
+                marker_ids = self._literal_think_marker_ids()
+                if marker_ids:
+                    tag_guard = self._get_literal_tag_guard(request_id)
+                    if response.token in marker_ids:
+                        new_text = tag_guard.flush() + new_text
+                    else:
+                        new_text = tag_guard.feed(new_text)
+
             # Prepend <think> tag for first chunk if this is a reasoning model.
             # Protocol parsers may expose a normalized prefix when their prompt
             # uses a model-specific open-think marker (e.g. MiniMax <mm:think>).
@@ -11055,15 +11110,22 @@ class Scheduler:
                     # Standard finalization without a protocol parser
                     # Finalize detokenizer to flush any remaining bytes
                     detokenizer = self._get_detokenizer(request_id)
+                    marker_ids = self._literal_think_marker_ids()
+                    tag_guard = (
+                        self._get_literal_tag_guard(request_id) if marker_ids else None
+                    )
                     if detokenizer is not None:
                         detokenizer.finalize()
                         final_segment = detokenizer.last_segment
+                        if tag_guard is not None:
+                            final_segment = tag_guard.feed(final_segment)
                         if final_segment:
                             output.new_text += final_segment
+                    if tag_guard is not None:
+                        output.new_text += tag_guard.flush()
 
                     # Decode full output
                     output.output_text = self.tokenizer.decode(request.output_token_ids)
-                    request.output_text = output.output_text
 
                     # Trim accumulated output text at the first stop string
                     # match so non-streaming responses do not include the
@@ -11076,8 +11138,20 @@ class Scheduler:
                             cut = output.output_text.find(ss)
                             if cut >= 0:
                                 output.output_text = output.output_text[:cut]
-                                request.output_text = output.output_text
                                 break
+
+                    # Same boundary guard as the streamed segments, applied to
+                    # the freshly decoded full text using the token ids.
+                    if marker_ids:
+                        from .api.thinking import guard_literal_think_tags_by_token_ids
+
+                        output.output_text = guard_literal_think_tags_by_token_ids(
+                            self.tokenizer,
+                            request.output_token_ids,
+                            output.output_text,
+                            marker_ids,
+                        )
+                    request.output_text = output.output_text
 
                 # Extract cache for future reuse.
                 # In the new API, prompt_cache is a direct value (not callable).
@@ -11649,6 +11723,7 @@ class Scheduler:
 
         # Clear detokenizer state to prevent contamination after recovery
         self._request_detokenizers.clear()
+        self._literal_tag_guards.clear()
 
         # Clear protocol-specific output parser sessions
         self._output_parser_sessions.clear()
@@ -11675,6 +11750,7 @@ class Scheduler:
         self.uid_to_request_id.clear()
         self._deferred_clear_at = None
         self._request_detokenizers.clear()
+        self._literal_tag_guards.clear()
         self._output_parser_sessions.clear()
 
         try:
@@ -12402,6 +12478,7 @@ class Scheduler:
 
         # Clear detokenizers
         self._request_detokenizers.clear()
+        self._literal_tag_guards.clear()
 
         # Clear protocol-specific output parser sessions
         self._output_parser_sessions.clear()

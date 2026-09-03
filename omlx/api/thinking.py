@@ -9,9 +9,12 @@ Used by reasoning models like DeepSeek R1, Qwen3/3.5, MiniMax that wrap
 their chain-of-thought reasoning in <think>...</think> tags.
 """
 
+import logging
 import re
 from collections.abc import Callable, Sequence
 from typing import List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # Tags used for thinking blocks
 _OPEN_TAG = "<think>"
@@ -22,12 +25,202 @@ _MINIMAX_OPEN_TAG = "<mm:think>"
 _MINIMAX_CLOSE_TAG = "</mm:think>"
 _HY3_OPEN_TAG = "<think:opensource>"
 _HY3_CLOSE_TAG = "</think:opensource>"
+_ALL_TAGS = (
+    _OPEN_TAG,
+    _CLOSE_TAG,
+    _MINIMAX_OPEN_TAG,
+    _MINIMAX_CLOSE_TAG,
+    _HY3_OPEN_TAG,
+    _HY3_CLOSE_TAG,
+)
+_MAX_TAG_LEN = max(len(tag) for tag in _ALL_TAGS)
 
 # Regex for non-streaming extraction (complete text)
 _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 # Handle case where <think> is missing but </think> is present
 # (scheduler prepends <think>\n but the tag may be split)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
+
+
+# ---------------------------------------------------------------------------
+# Literal think-tag guard
+#
+# The reasoning boundary travels between the engine and the API layer as the
+# text markers ``<think>`` / ``</think>``. A model can also *spell out* those
+# tags as ordinary text — e.g. when it explains how thinking tags work, or
+# quotes a prompt that discusses ``</think>`` — and the text-based parsers
+# below cannot tell such a quotation from the real boundary. The observed
+# failure is a thinking block that "closes" on a quoted ``</think>``: the rest
+# of the reasoning is returned as ``content`` and ``reasoning_content`` is
+# truncated.
+#
+# Producers that know the real boundary from token ids — protocol output
+# parsers (Gemma 4's ``<channel|>``, MiniMax's ``<mm:think>`` ids, ...) and
+# the scheduler's ``think_end_id`` for plain reasoning models — neutralise
+# literal spellings before they enter the text stream by inserting
+# ``LITERAL_TAG_GUARD`` right before the closing ``>``. The guard is a Unicode
+# noncharacter (U+FDD0) that tokenizers never produce, so a guarded tag
+# (``</think`` + guard + ``>``) can no longer match any marker.
+# ``extract_thinking`` and ``ThinkingParser`` strip the guard again, so
+# clients receive the original text. The guard sits before ``>`` (not after
+# ``<``) so a streaming producer can still apply it when the tag completes
+# one token at a time.
+# ---------------------------------------------------------------------------
+LITERAL_TAG_GUARD = "\ufdd0"
+_LITERAL_TAG_RE = re.compile(r"<(/?)(think|mm:think|think:opensource)>")
+
+
+def guard_literal_think_tags(text: str) -> str:
+    """Neutralise every think tag spelled out in ``text``.
+
+    Only call this on text that is known *not* to carry a real reasoning
+    boundary (the producer has already separated the boundary token).
+    """
+    if not text or "<" not in text:
+        return text
+    return _LITERAL_TAG_RE.sub(
+        lambda m: f"<{m.group(1)}{m.group(2)}{LITERAL_TAG_GUARD}>", text
+    )
+
+
+def unguard_literal_think_tags(text: str) -> str:
+    """Restore tags neutralised by :func:`guard_literal_think_tags`."""
+    if not text or LITERAL_TAG_GUARD not in text:
+        return text
+    return text.replace(LITERAL_TAG_GUARD, "")
+
+
+def _partial_tag_suffix_len(text: str) -> int:
+    """Length of the longest suffix of ``text`` that is a proper prefix of a tag."""
+    max_len = min(len(text), _MAX_TAG_LEN - 1)
+    for size in range(max_len, 0, -1):
+        suffix = text[-size:]
+        if any(
+            len(suffix) < len(tag) and tag.startswith(suffix) for tag in _ALL_TAGS
+        ):
+            return size
+    return 0
+
+
+class LiteralThinkTagGuard:
+    """Streaming variant of :func:`guard_literal_think_tags`.
+
+    Text arrives one token at a time, so a spelled-out tag such as
+    ``</think>`` may be split as ``</``, ``think``, ``>``. The guard holds
+    back a trailing partial tag until it either completes (and is guarded)
+    or turns out to be ordinary text. Call :meth:`flush` before emitting a
+    real boundary marker and at end of generation so held text keeps its
+    position in the stream.
+    """
+
+    def __init__(self, label: str = "") -> None:
+        self._held = ""
+        self._label = label
+        self.guarded_count = 0
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        source = self._held + text
+        self._held = ""
+        keep = _partial_tag_suffix_len(source)
+        if keep:
+            self._held = source[-keep:]
+            source = source[:-keep]
+        if not source:
+            return ""
+        guarded = guard_literal_think_tags(source)
+        if guarded != source:
+            self.guarded_count += 1
+            logger.info(
+                "Neutralised a literal think tag spelled out by the model%s; "
+                "it is kept as text and not treated as the reasoning boundary",
+                f" ({self._label})" if self._label else "",
+            )
+        return guarded
+
+    def flush(self) -> str:
+        held, self._held = self._held, ""
+        return held
+
+    @property
+    def pending(self) -> bool:
+        return bool(self._held)
+
+
+def guard_literal_think_tags_by_token_ids(
+    tokenizer,
+    token_ids: Sequence[int],
+    text: str,
+    marker_token_ids: Sequence[int],
+) -> str:
+    """Guard spelled-out tags in a fully decoded ``text`` using token ids.
+
+    ``marker_token_ids`` are the ids that legitimately render as think
+    markers (``think_start_id`` / ``think_end_id``). The token list is split
+    into runs at those ids, each run is decoded and guarded separately, and
+    the marker tokens are decoded verbatim. When the piecewise decode does
+    not reproduce ``text`` exactly (tokenizer-specific whitespace handling),
+    the original text is returned untouched so nothing is silently altered.
+    """
+    if not text or not token_ids or not marker_token_ids:
+        return text
+    if _LITERAL_TAG_RE.search(text) is None:
+        return text
+    marker_set = set(marker_token_ids)
+    if not any(tid in marker_set for tid in token_ids):
+        # No real boundary token was generated: every spelled-out tag is
+        # literal text.
+        return guard_literal_think_tags(text)
+
+    decode = _safe_tokenizer_attr(tokenizer, "decode")
+    if not callable(decode):
+        return text
+
+    raw_parts: list[str] = []
+    guarded_parts: list[str] = []
+    run: list[int] = []
+
+    def _flush_run() -> bool:
+        if not run:
+            return True
+        try:
+            piece = decode(list(run))
+        except Exception:
+            return False
+        raw_parts.append(piece)
+        guarded_parts.append(guard_literal_think_tags(piece))
+        run.clear()
+        return True
+
+    for tid in token_ids:
+        if tid in marker_set:
+            if not _flush_run():
+                return text
+            try:
+                marker_text = decode([tid])
+            except Exception:
+                return text
+            raw_parts.append(marker_text)
+            guarded_parts.append(marker_text)
+        else:
+            run.append(tid)
+    if not _flush_run():
+        return text
+
+    if "".join(raw_parts) != text:
+        logger.debug(
+            "Piecewise decode did not reproduce the output text; leaving "
+            "spelled-out think tags unguarded"
+        )
+        return text
+    guarded = "".join(guarded_parts)
+    if guarded != text:
+        logger.info(
+            "Neutralised a literal think tag spelled out by the model (final "
+            "text); it is kept as text and not treated as the reasoning boundary"
+        )
+    return guarded
 
 
 def _safe_tokenizer_attr(tokenizer, attr: str, default=None):
@@ -145,6 +338,19 @@ def prompt_opens_thinking(
 def extract_thinking(text: str) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
+    Guarded literal tags (see :data:`LITERAL_TAG_GUARD`) are not treated as
+    boundaries; the guard is stripped from both returned parts.
+    """
+    thinking, content = _extract_thinking_impl(text)
+    return (
+        unguard_literal_think_tags(thinking),
+        unguard_literal_think_tags(content),
+    )
+
+
+def _extract_thinking_impl(text: str) -> Tuple[str, str]:
+    """Extract thinking and content from complete text.
+
     Handles:
     - Normal: ``<think>reasoning</think>answer`` → ``("reasoning", "answer")``
     - No thinking: ``just answer`` → ``("", "just answer")``
@@ -246,6 +452,21 @@ class ThinkingParser:
         self._close_seen: bool = False
         self._thinking_accumulated: List[str] = []
         self._content_emitted: bool = False
+        # Structural oddities observed while parsing, for diagnostics:
+        # ``stray_close`` — a close tag arrived while not inside thinking;
+        # ``reopen`` — an open tag arrived after the block had been closed.
+        # Both are the signature of a boundary that fired on text the
+        # producer failed to guard, or of a model re-entering thinking.
+        self.anomalies: List[str] = []
+
+    def _note_anomaly(self, kind: str) -> None:
+        self.anomalies.append(kind)
+        if self.anomalies.count(kind) == 1:
+            logger.warning(
+                "Thinking boundary anomaly (%s): a think tag appeared where no "
+                "boundary was expected; reasoning/content split may be off",
+                kind,
+            )
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -274,23 +495,31 @@ class ThinkingParser:
 
                 # Try to match <think>
                 if remaining.startswith(_OPEN_TAG):
+                    if self._close_seen and not self._in_thinking:
+                        self._note_anomaly("reopen")
                     self._in_thinking = True
                     i += _OPEN_LEN
                     continue
 
                 if remaining.startswith(_HY3_OPEN_TAG):
+                    if self._close_seen and not self._in_thinking:
+                        self._note_anomaly("reopen")
                     self._in_thinking = True
                     i += len(_HY3_OPEN_TAG)
                     continue
 
                 # Try to match </think>
                 if remaining.startswith(_CLOSE_TAG):
+                    if not self._in_thinking:
+                        self._note_anomaly("stray_close")
                     self._in_thinking = False
                     self._close_seen = True
                     i += _CLOSE_LEN
                     continue
 
                 if remaining.startswith(_HY3_CLOSE_TAG):
+                    if not self._in_thinking:
+                        self._note_anomaly("stray_close")
                     self._in_thinking = False
                     self._close_seen = True
                     i += len(_HY3_CLOSE_TAG)
@@ -315,8 +544,8 @@ class ThinkingParser:
                     content_out.append(text[i])
                 i += 1
 
-        thinking_delta = "".join(thinking_out)
-        content_delta = "".join(content_out)
+        thinking_delta = unguard_literal_think_tags("".join(thinking_out))
+        content_delta = unguard_literal_think_tags("".join(content_out))
         if thinking_delta:
             self._thinking_accumulated.append(thinking_delta)
         if content_delta:
@@ -337,7 +566,7 @@ class ThinkingParser:
             Tuple of (thinking_text, content_text) from remaining buffer
             (plus recovered content if applicable).
         """
-        partial = self._buffer
+        partial = unguard_literal_think_tags(self._buffer)
         self._buffer = ""
 
         # Recovery: prompt opened a thinking block (or model echoed
