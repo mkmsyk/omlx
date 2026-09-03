@@ -1560,9 +1560,12 @@ def _parse_tool_calls_impl(
     """parse_tool_calls body, pre-remap. See the public wrapper's docstring."""
     cleaned_text = text
 
-    # Remove thinking tags if present (reasoning models)
+    # Remove a leading thinking block if present (reasoning models). Only the
+    # block at the start of the text is a real reasoning block; a
+    # ``<think>…</think>`` pair further in is the model quoting the tags
+    # (e.g. explaining how thinking works) and must stay in the answer.
     cleaned_text = re.sub(
-        r"<think>.*?</think>", "", cleaned_text, flags=re.DOTALL
+        r"\A\s*(?:<think>.*?</think>\s*)+", "", cleaned_text, flags=re.DOTALL
     ).strip()
 
     # Try mlx-lm's native tool parser first

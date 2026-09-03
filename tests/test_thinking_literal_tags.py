@@ -201,6 +201,24 @@ class TestExtractThinkingWithGuard:
         assert thinking == ""
         assert content == "Answer only"
 
+    def test_tool_call_extraction_keeps_quoted_tag_pair_in_content(self):
+        """Non-stream chat path: parse_tool_calls must not eat a quoted pair."""
+        from omlx.api.tool_calling import extract_tool_calls_with_thinking
+
+        content = "回答の前に`<think>`と`</think>`を出力します。"
+        extraction = extract_tool_calls_with_thinking(
+            "plan", content, tokenizer=None, tools=None
+        )
+        assert extraction.cleaned_text == content
+        assert not extraction.tool_calls
+
+    def test_tool_call_extraction_still_strips_leading_block(self):
+        from omlx.api.tool_calling import parse_tool_calls
+
+        cleaned, calls = parse_tool_calls("<think>\nplan\n</think>\nAnswer", None)
+        assert cleaned == "Answer"
+        assert not calls
+
 
 # ---------------------------------------------------------------------------
 # Streaming parser
