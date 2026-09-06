@@ -5322,12 +5322,22 @@ def _build_active_models_data() -> dict:
     models = []
     total_active = 0
     total_waiting = 0
+    settings_manager = _get_settings_manager()
 
     for model_info in status.get("models", []):
         if not model_info.get("loaded") and not model_info.get("is_loading"):
             continue
 
         model_id = model_info["id"]
+        model_settings = (
+            settings_manager.get_settings(model_id)
+            if settings_manager is not None
+            else None
+        )
+        is_hidden = bool(
+            model_settings is not None
+            and getattr(model_settings, "is_hidden", False)
+        )
         active_requests = 0
         waiting_requests = 0
         running_by_id = {}
@@ -5460,9 +5470,7 @@ def _build_active_models_data() -> dict:
 
         # Determine effective TTL: per-model ttl_seconds first, then global idle_timeout.
         effective_ttl: int | None = None
-        settings_manager = _get_settings_manager()
         if is_loaded and settings_manager is not None:
-            model_settings = settings_manager.get_settings(model_id)
             if (
                 model_settings is not None
                 and getattr(model_settings, "ttl_seconds", None) is not None
@@ -5496,35 +5504,36 @@ def _build_active_models_data() -> dict:
                     "pairing_warning": pairing,
                 }
 
-        models.append(
-            {
-                "id": model_id,
-                "estimated_size": model_info.get("estimated_size", 0),
-                "estimated_size_formatted": format_size(
-                    model_info.get("estimated_size", 0)
-                ),
-                "actual_size": model_info.get("actual_size") or 0,
-                "actual_size_formatted": (
-                    format_size(model_info.get("actual_size", 0))
-                    if model_info.get("actual_size")
-                    else None
-                ),
-                "pinned": model_info.get("pinned", False),
-                "is_loading": model_info.get("is_loading", False),
-                "loading_elapsed_seconds": loading_elapsed_seconds,
-                "loading_estimated_seconds": loading_estimated_seconds,
-                "loading_remaining_seconds_estimate": loading_remaining_seconds_estimate,
-                "active_requests": active_requests,
-                "waiting_requests": waiting_requests,
-                "waiting": waiting,
-                "activities": activities,
-                "prefilling": prefilling,
-                "generating": generating,
-                "idle_seconds": idle_seconds,
-                "ttl_remaining_seconds": ttl_remaining_seconds,
-                "dflash": dflash_info,
-            }
-        )
+        if not is_hidden:
+            models.append(
+                {
+                    "id": model_id,
+                    "estimated_size": model_info.get("estimated_size", 0),
+                    "estimated_size_formatted": format_size(
+                        model_info.get("estimated_size", 0)
+                    ),
+                    "actual_size": model_info.get("actual_size") or 0,
+                    "actual_size_formatted": (
+                        format_size(model_info.get("actual_size", 0))
+                        if model_info.get("actual_size")
+                        else None
+                    ),
+                    "pinned": model_info.get("pinned", False),
+                    "is_loading": model_info.get("is_loading", False),
+                    "loading_elapsed_seconds": loading_elapsed_seconds,
+                    "loading_estimated_seconds": loading_estimated_seconds,
+                    "loading_remaining_seconds_estimate": loading_remaining_seconds_estimate,
+                    "active_requests": active_requests,
+                    "waiting_requests": waiting_requests,
+                    "waiting": waiting,
+                    "activities": activities,
+                    "prefilling": prefilling,
+                    "generating": generating,
+                    "idle_seconds": idle_seconds,
+                    "ttl_remaining_seconds": ttl_remaining_seconds,
+                    "dflash": dflash_info,
+                }
+            )
 
         total_active += active_requests
         total_waiting += waiting_requests
