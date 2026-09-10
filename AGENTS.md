@@ -11,7 +11,7 @@ oMLX リポジトリの AI 用作業入口。ここには常時適用するル�
 
 ## 1. 開発文書の運用
 
-- 文書は `~/.claude/docs-management-standard.md` の三層構造に従う。
+- 文書は [開発文書規格](https://github.com/mkmsyk/claude-global-config/blob/main/docs-management-standard.md) の三層構造に従う。
 - ルート `AGENTS.md` は常時ルールだけに保ち、総則は `docs/<product>/<product>.md`、個別仕様・計画・検証記録・タスクリストは `docs/<product>/<product>-<feature>.{spec,plan,walkthrough,tasks}.md` に置く。
 - 進行中の作業はリポジトリルートの `implementation_plan.md`、`walkthrough.md`、`task.md` を使い、完了時に `docs/` の各論へアーカイブしてルートのファイルを空テンプレートへ戻す。
 - 完了済み計画、検証記録、事故記録、撤回済みの経緯、過去の実測値は `docs/archive/` に隔離し、`docs/INDEX.md` の通常の本表には混ぜない。
