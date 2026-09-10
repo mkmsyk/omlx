@@ -18,6 +18,8 @@ import copy
 import gc
 import json
 import logging
+import os
+import urllib.request
 import time
 from collections import OrderedDict
 from contextlib import asynccontextmanager
@@ -1980,6 +1982,35 @@ class EnginePool:
             return False
 
         evicted_any = False
+        control_url = os.environ.get("KRISIS_CONTROL_URL")
+        if control_url:
+            # 管制のunloadが同じpool lockを取得するため、HTTPをlock内で待たない。
+            while True:
+                current = max(mx.get_active_memory(), get_phys_footprint(), self._current_model_memory)
+                if current + predicted <= target:
+                    return evicted_any
+                runtime = os.environ.get("KRISIS_RUNTIME_NAME")
+                if not runtime:
+                    raise RuntimeError("KRISIS_RUNTIME_NAME is required for managed prefill eviction")
+                payload = {"runtime": runtime, "requestingModel": exclude_model_id,
+                           "requestId": request_id, "currentBytes": current,
+                           "predictedBytes": predicted, "targetBytes": target}
+
+                def request_relief():
+                    request = urllib.request.Request(
+                        control_url.rstrip("/") + "/control/prefill/relieve",
+                        data=json.dumps(payload).encode("utf-8"), method="POST",
+                        headers={"Content-Type": "application/json"})
+                    with urllib.request.urlopen(request, timeout=60) as response:
+                        result = json.load(response)
+                    if result.get("ok") is not True or not isinstance(result.get("evicted"), list):
+                        raise RuntimeError("invalid managed prefill control response")
+                    return result
+
+                result = await asyncio.to_thread(request_relief)
+                if not result["evicted"]:
+                    break
+                evicted_any = True
         reclaim_attempted = False
         ane_release_attempted = False
         # Snapshot once per call: "a PREVIOUS pass for this request already
@@ -2002,7 +2033,7 @@ class EnginePool:
                     # after an attempt means admission will now succeed.
                     return evicted_any or reclaim_attempted or ane_release_attempted
 
-                victim = self._find_lru_prefill_eviction_victim(
+                victim = None if control_url else self._find_lru_prefill_eviction_victim(
                     exclude_model_id=exclude_model_id
                 )
                 if victim is None:
@@ -2289,6 +2320,15 @@ class EnginePool:
             if self._entry_has_active_requests(e):
                 return True
         return False
+
+    async def unload_idle_for_control(self, model_id: str) -> dict:
+        """管制が選んだ候補を再検証する。ここで別の候補を選ばない。"""
+        async with self._lock:
+            entry = self._entries.get(model_id)
+            if entry is None or not self._is_idle_for_prefill_eviction(entry):
+                return {"ok": False, "skipped": "model_busy_or_missing"}
+            await self._unload_engine(model_id)
+            return {"ok": True, "model_id": model_id}
 
     async def _unload_engine(self, model_id: str) -> None:
         """
@@ -3174,6 +3214,7 @@ class EnginePool:
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
+                    "prefill_eviction_eligible": self._is_idle_for_prefill_eviction(e),
                 }
                 for mid, e in sorted(self._entries.items())
             ],

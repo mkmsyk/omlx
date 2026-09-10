@@ -3038,10 +3038,13 @@ async def list_models_status(_: bool = Depends(verify_api_key)):
 
 
 @app.post("/v1/models/{model_id}/unload")
-async def unload_model(model_id: str, _: bool = Depends(verify_api_key)):
+async def unload_model(model_id: str, _: bool = Depends(verify_api_key), only_idle: bool = False):
     """Manually unload a model from memory."""
     if _server_state.engine_pool is None:
         raise HTTPException(status_code=503, detail="Server not initialized")
+
+    if only_idle:
+        return await _server_state.engine_pool.unload_idle_for_control(model_id)
 
     entry = _server_state.engine_pool.get_entry(model_id)
     if entry is None:

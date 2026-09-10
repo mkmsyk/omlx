@@ -4,6 +4,8 @@
 import asyncio
 import concurrent.futures
 import json
+import io
+import os
 import logging
 import shutil
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -2116,6 +2118,58 @@ class TestEnginePoolPrefillEviction:
         scheduler = MagicMock()
         scheduler._reclaim_prefill_headroom = MagicMock(side_effect=reclaim_fn)
         return scheduler
+
+    @pytest.mark.asyncio
+    async def test_managed_prefill_calls_control_outside_pool_lock(self):
+        pool = _make_pool(ceiling=0)
+        pool._entries = {"idle": self._entry("idle", 60), "target": self._entry("target", 30)}
+        pool._current_model_memory = 90
+        pool._find_lru_prefill_eviction_victim = MagicMock(side_effect=AssertionError("local victim selection"))
+        calls = []
+        def control(request, **kwargs):
+            assert not pool._lock.locked()
+            calls.append(json.loads(request.data))
+            pool._current_model_memory = 30
+            return io.BytesIO(b'{"ok": true, "evicted": ["idle"]}')
+        request = PrefillEvictionRequest(request_id="r", model_id="target", current_bytes=90,
+            target_cap_bytes=80, predicted_transient_bytes=10, requested_tokens=10, reason="test")
+        with patch.dict(os.environ, {"KRISIS_CONTROL_URL": "http://control", "KRISIS_RUNTIME_NAME": "mlx"}), \
+                patch("omlx.engine_pool.urllib.request.urlopen", side_effect=control), \
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0), \
+                patch("omlx.engine_pool.get_phys_footprint", return_value=0):
+            assert await pool._evict_idle_lru_for_prefill("target", request)
+        assert calls[0]["requestingModel"] == "target"
+        pool._find_lru_prefill_eviction_victim.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_managed_prefill_control_failure_never_evicts_locally(self):
+        pool = _make_pool(ceiling=0)
+        pool._current_model_memory = 90
+        pool._unload_engine = AsyncMock()
+        request = PrefillEvictionRequest(request_id="r", model_id="target", current_bytes=90,
+            target_cap_bytes=80, predicted_transient_bytes=10, requested_tokens=10, reason="test")
+        with patch.dict(os.environ, {"KRISIS_CONTROL_URL": "http://control", "KRISIS_RUNTIME_NAME": "mlx"}), \
+                patch("omlx.engine_pool.urllib.request.urlopen", side_effect=OSError("control disconnected")), \
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0), \
+                patch("omlx.engine_pool.get_phys_footprint", return_value=0):
+            with pytest.raises(OSError, match="control disconnected"):
+                await pool._evict_idle_lru_for_prefill("target", request)
+        pool._unload_engine.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_conditional_control_unload_rechecks_busy_under_lock(self):
+        pool = _make_pool(ceiling=0)
+        pool._entries = {"idle": self._entry("idle", 60)}
+        pool._unload_engine = AsyncMock()
+        pool._entries["idle"].in_use = 1
+        assert (await pool.unload_idle_for_control("idle"))["skipped"] == "model_busy_or_missing"
+        pool._unload_engine.assert_not_awaited()
+        pool._entries["idle"].in_use = 0
+        async def unload(mid):
+            assert pool._lock.locked()
+        pool._unload_engine.side_effect = unload
+        assert (await pool.unload_idle_for_control("idle"))["ok"] is True
+        pool._unload_engine.assert_awaited_once_with("idle")
 
     @pytest.mark.asyncio
     async def test_prefill_eviction_evicts_idle_lru_until_target(self):
