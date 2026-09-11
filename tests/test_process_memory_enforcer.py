@@ -1519,6 +1519,9 @@ class TestSingleModelMemoryPressure:
         assert entry.engine is not None
         assert entry.pending_unload_reason == "hard memory pressure"
         assert entry.abort_requested is True
+        enforcer._engine_pool._schedule_pending_unload_locked.assert_called_once_with(
+            "big-model"
+        )
 
         entry.in_use = 0
         await enforcer._engine_pool._unload_pending_if_idle_locked("big-model")

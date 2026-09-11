@@ -1649,9 +1649,17 @@ class ProcessMemoryEnforcer:
                                 "hard memory pressure",
                                 abort_requested=True,
                             )
-                            await self._engine_pool._unload_pending_if_idle_locked(
+                            unloaded = await self._engine_pool._unload_pending_if_idle_locked(
                                 busy_victim
                             )
+                            if not unloaded:
+                                # abort_all_requests() only asks the scheduler to stop.  A
+                                # request collector can drain after this enforcement pass and
+                                # no later lease release is guaranteed to wake the pool again.
+                                # Keep the pending marker as the admission gate, but also start
+                                # the pool's existing quiescence watcher so it is eventually
+                                # consumed instead of rejecting every later acquisition forever.
+                                self._engine_pool._schedule_pending_unload_locked(busy_victim)
                         logger.warning(
                             "Hard memory pressure: requested abort/unload for "
                             "'%s' (aborted=%d)",
