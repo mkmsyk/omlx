@@ -31,5 +31,8 @@ Passportを唯一の人間向けsession発行・検証・失効元とし、機�
   backendは進行中推論の完了と資源解放を待って正常終了させ、導入済みアプリの`Start Server`から
   再起動した。再起動後は未構成警告が消え、`client=omlx`、登録loopback origin、
   `/admin/dashboard` callbackを持つPassport画面まで実操作で到達した。
+- API key作成前から起動していたネイティブアプリは古い空設定のため統計取得が401になった。
+  メニューバーの正式な`Quit oMLX`から正常終了して再起動し、機械Bearerを再読込させた。
+  配信統計は実データ、active model、server uptime、cache情報を表示し、401が消えたことを確認した。
 - 新規ブラウザに本人のPassport sessionが無いため、本人確認後のcallbackとlogoutの実入力確認は
   行っていない。

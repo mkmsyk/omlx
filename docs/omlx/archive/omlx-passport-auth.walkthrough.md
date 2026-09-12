@@ -17,4 +17,6 @@
 - 導入済みアプリの`Start Server`からbackendを起動し、loopback管理画面がPassport専用ログインを
   表示することを確認した。CTAを実際に押し、`client=omlx`、登録origin、callback先を持つ
   Passportのprovider選択画面へ到達した。
+- ネイティブアプリをメニューバーの正式な終了経路から再起動し、機械API keyの再読込後、
+  配信統計に実データ、active model、server uptime、cache情報が表示されることを確認した。
 - 新規ブラウザに本人のPassport sessionが無いため、本人確認後のcallbackとlogoutは未実施。
