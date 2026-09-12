@@ -13,4 +13,12 @@
   Scheduler / ProcessMemoryEnforcer対象テストは成功した。
 - `git diff --check`: 成功。
 
-実機でpressureを人為的に起こす検証は、稼働中requestを危険に晒すため実施していない。
+## 実機反映
+
+Krisisの実APIで`activeRequests=0`、推論待ち0、execution lease 0を確認してから、
+`POST /control/unload`と`POST /control/runtime/mlx/stop`の正規経路で旧processを終了した。
+oMLXは`~/.venvs/omlx`から本checkoutをeditable importする構成であり、停止後の明示loadによって
+main `d6acd402`から新processを起動した。Gemma 4 26B-A4Bのloadは11.04秒で成功し、
+Krisisからruntime up、active request / 推論待ち / execution leaseが全て0であることを確認した。
+
+実機でhard/emergency pressureを人為的に起こす検証は、稼働中requestを危険に晒すため実施していない。

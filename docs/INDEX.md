@@ -16,7 +16,7 @@
 
 [メモリ圧力後のpending unload回復](internal/session-pending-unload-recovery-20260912.md)。
 
-[プロセスメモリ圧力時の個別request退避](internal/session-process-memory-request-defer-20260912.md)。
+[プロセスメモリ圧力時の個別request退避と実機反映](internal/session-process-memory-request-defer-20260912.md)。
 
 ## アーカイブ
 
