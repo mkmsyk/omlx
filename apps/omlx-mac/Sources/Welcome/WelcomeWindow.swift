@@ -362,8 +362,8 @@ final class WelcomeViewModel: ObservableObject {
             return false
         }
 
-        // 4. Best-effort post-start fix-ups: setup-api-key (or login if the
-        // server already had one) + hf_endpoint patch. None of these are
+        // 4. Best-effort post-start machine API-key setup. This never creates
+        // a browser session. None of these operations are
         // fatal on first run — the user can re-do them in Security /
         // Server screens.
         // Give the server a beat to bind, then wait until the health-check
@@ -398,8 +398,8 @@ final class WelcomeViewModel: ObservableObject {
 
     private func setupServerApiKey(client: OMLXClient, key: String) async -> Bool {
         // Try setup-api-key (fresh install). When the server already has a
-        // key set, the endpoint returns 400 — we swallow that and let
-        // `OMLXClient`'s 401 auto-login handle the next authenticated call.
+        // key set, the endpoint returns 400 and the client uses that existing
+        // key directly as a machine Bearer on subsequent calls.
         // The server is local-only on first run, so we don't need an
         // explicit login round-trip here.
         do {

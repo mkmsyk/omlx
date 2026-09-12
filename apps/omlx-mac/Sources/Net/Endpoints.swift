@@ -11,7 +11,6 @@ import Foundation
 enum AdminAPI {
     static let prefix = "/admin/api"
 
-    static let login           = "\(prefix)/login"
     static let globalSettings  = "\(prefix)/global-settings"
     static let serverInfo      = "\(prefix)/server-info"
     static let stats           = "\(prefix)/stats"

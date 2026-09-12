@@ -8,7 +8,7 @@
 //   • Start Server    (STOPPED / IDLE / FAILED)
 //   • Serving Stats     (Session + All-Time submenu)
 //   • Open Web Dashboard (enabled when running — opens the web admin
-//                        dashboard in the browser via /admin/auto-login)
+//                        dashboard in the browser via Bunrin Passport)
 //   • Chat with oMLX    (enabled when running — opens /admin/chat in browser)
 //   • Settings…         (Cmd-, — opens the SwiftUI AppView window via the
 //                        openAppView callback; available even when stopped)
@@ -313,7 +313,7 @@ final class MenubarController: NSObject {
 
         webAdminItem = item(String(localized: "menubar.item.web_dashboard",
                                    defaultValue: "Open Web Dashboard",
-                                   comment: "Menubar item that opens the browser-based web admin dashboard with auto-login"),
+                                   comment: "Menubar item that opens the Passport-backed web admin dashboard"),
                             action: #selector(openWebAdmin),
                             symbol: "globe")
         menu.addItem(webAdminItem)
@@ -1007,7 +1007,7 @@ final class MenubarController: NSObject {
         guard serverIsRunning else { return }
         let host = MenubarController.displayHost(server: server, fallback: config.host)
         let port = MenubarController.displayPort(server: server, fallback: config.port)
-        guard let url = MenubarController.webAdminURL(host: host, port: port, apiKey: config.apiKey) else { return }
+        guard let url = MenubarController.webAdminURL(host: host, port: port) else { return }
         NSWorkspace.shared.open(url)
     }
 
@@ -1396,22 +1396,12 @@ extension MenubarController {
         server?.host ?? fallback
     }
 
-    /// Builds the browser URL for the web admin dashboard. Uses the
-    /// `/admin/auto-login` endpoint so the dashboard opens without the
-    /// manual login form: the server validates the main API key, sets the
-    /// session cookie, then redirects to `redirect`. A missing/stale key
-    /// makes the endpoint redirect to the login page instead — a graceful
-    /// fallback, so we still emit the URL.
-    ///
-    /// `URLComponents.queryItems` percent-encodes the key, so a key
-    /// containing `&`, `=`, `/`, spaces etc. is transmitted intact. The one
-    /// exception is `+`: URLComponents leaves it unescaped and servers
-    /// decode `+` as a space (form-urlencoded semantics), which would
-    /// corrupt a key containing `+`. We escape it explicitly below.
+    /// Builds the browser URL for the web admin entry. The browser completes
+    /// Bunrin Passport login itself; an API key is never put in a URL.
     ///
     /// Internal (not private) so `MenubarControllerPortTests` can exercise
     /// it without a live `NSStatusBar`.
-    static func webAdminURL(host: String, port: Int, apiKey: String?) -> URL? {
+    static func webAdminURL(host: String, port: Int) -> URL? {
         guard let baseURL = AppConfig.httpURL(
             host: AppConfig.connectableHost(for: host),
             port: port
@@ -1420,14 +1410,7 @@ extension MenubarController {
         else {
             return nil
         }
-        comps.path = "/admin/auto-login"
-        var items = [URLQueryItem(name: "redirect", value: "/admin/dashboard")]
-        if let key = apiKey, !key.isEmpty {
-            items.append(URLQueryItem(name: "key", value: key))
-        }
-        comps.queryItems = items
-        comps.percentEncodedQuery = comps.percentEncodedQuery?
-            .replacingOccurrences(of: "+", with: "%2B")
+        comps.path = "/admin"
         return comps.url
     }
 

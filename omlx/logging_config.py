@@ -42,8 +42,6 @@ class AdminStatsAccessFilter(logging.Filter):
         msg = record.getMessage()
         if "/admin/api/stats" in msg:
             return False
-        if "/admin/api/login" in msg:
-            return False
         if "/admin/api/hf/tasks" in msg:
             return False
         if "/admin/api/oq/tasks" in msg:

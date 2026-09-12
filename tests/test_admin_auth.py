@@ -2,12 +2,12 @@
 """Tests for admin authentication and chat page API key injection."""
 
 import asyncio
-import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from floated_claim.passport_exchange import PassportClientError, PassportSession
 
 import omlx.server  # noqa: F401 — ensure server module is imported first
 import omlx.admin.auth as admin_auth
@@ -34,107 +34,86 @@ def _restore_getter(original):
     admin_routes._get_global_settings = original
 
 
-class TestAutoLogin:
-    """Tests for GET /admin/auto-login endpoint."""
+class FakePassport:
+    def __init__(self, *, authorized=True):
+        self.client_origin = "http://localhost:8000"
+        self.authorized = authorized
+        self.validated = None
+        self.revoked = None
 
-    def test_auto_login_success_redirects_to_dashboard(self):
-        """Valid API key should redirect to the specified path with session cookie."""
-        mock_settings = _mock_global_settings(api_key="test-key")
-        original = _patch_getter(mock_settings)
-        try:
+    def login_url(self, *, next_path):
+        return f"https://id.bunrin.work/login?next={next_path}"
+
+    async def redeem_ticket(self, *, ticket):
+        if ticket != "ticket":
+            raise PassportClientError()
+        return PassportSession(
+            "600f7f6d-dc60-4f20-bba1-0a91eb906d4b",
+            self.authorized,
+            "passport-token",
+            4_000_000_000,
+        )
+
+    async def validate_session(self, *, token):
+        self.validated = token
+        return PassportSession(
+            "600f7f6d-dc60-4f20-bba1-0a91eb906d4b",
+            self.authorized,
+            token,
+            4_000_000_000,
+        )
+
+    async def revoke_session(self, *, token):
+        self.revoked = token
+
+
+class TestPassportRoutes:
+    def test_api_key_browser_session_routes_are_absent(self):
+        paths = {route.path for route in admin_routes.router.routes}
+        assert "/admin/api/login" not in paths
+        assert "/admin/auto-login" not in paths
+
+    def test_login_uses_registered_client_and_sanitizes_next(self):
+        passport = FakePassport()
+        with patch.object(admin_routes, "passport_client", return_value=passport):
+            result = asyncio.run(admin_routes.passport_login(next="//attacker.test"))
+        assert result.status_code == 302
+        assert result.headers["location"].endswith("next=/admin/dashboard")
+
+    def test_callback_relays_passport_token(self):
+        passport = FakePassport()
+        with (
+            patch.object(admin_routes, "passport_client", return_value=passport),
+            patch.object(admin_routes, "cookie_secure", return_value=False),
+        ):
             result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin/dashboard")
+                admin_routes.passport_callback(ticket="ticket", next="/admin/chat")
             )
-            assert result.status_code == 302
-            assert result.headers["location"] == "/admin/dashboard"
-            # Check that session cookie is set
-            cookie_header = result.headers.get("set-cookie", "")
-            assert "omlx_admin_session" in cookie_header
-        finally:
-            _restore_getter(original)
+        assert result.headers["location"] == "/admin/chat"
+        assert "bunrin_session=passport-token" in result.headers["set-cookie"]
+        assert "omlx_admin_session" not in result.headers["set-cookie"]
 
-    def test_auto_login_success_redirects_to_chat(self):
-        """Valid API key should redirect to chat page."""
-        mock_settings = _mock_global_settings(api_key="test-key")
-        original = _patch_getter(mock_settings)
-        try:
-            result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin/chat")
-            )
-            assert result.status_code == 302
-            assert result.headers["location"] == "/admin/chat"
-        finally:
-            _restore_getter(original)
+    def test_callback_rejects_non_admin_decision(self):
+        with patch.object(
+            admin_routes, "passport_client", return_value=FakePassport(authorized=False)
+        ):
+            result = asyncio.run(admin_routes.passport_callback(ticket="ticket"))
+        assert result.headers["location"] == "/admin?error=passport"
+        assert "set-cookie" not in result.headers
 
-    def test_auto_login_invalid_key_redirects_to_login(self):
-        """Invalid API key should redirect to login page without session cookie."""
-        mock_settings = _mock_global_settings(api_key="correct-key")
-        original = _patch_getter(mock_settings)
-        try:
-            result = asyncio.run(
-                admin_routes.auto_login(key="wrong-key", redirect="/admin/dashboard")
-            )
-            assert result.status_code == 302
-            assert result.headers["location"] == "/admin"
-            cookie_header = result.headers.get("set-cookie", "")
-            assert "omlx_admin_session" not in cookie_header
-        finally:
-            _restore_getter(original)
-
-    def test_auto_login_empty_key_redirects_to_login(self):
-        """Empty API key should redirect to login page."""
-        mock_settings = _mock_global_settings(api_key="test-key")
-        original = _patch_getter(mock_settings)
-        try:
-            result = asyncio.run(
-                admin_routes.auto_login(key="", redirect="/admin/dashboard")
-            )
-            assert result.status_code == 302
-            assert result.headers["location"] == "/admin"
-        finally:
-            _restore_getter(original)
-
-    def test_auto_login_no_server_key_redirects_to_login(self):
-        """No server API key configured should redirect to login page."""
-        mock_settings = _mock_global_settings(api_key=None)
-        original = _patch_getter(mock_settings)
-        try:
-            result = asyncio.run(
-                admin_routes.auto_login(key="any-key", redirect="/admin/dashboard")
-            )
-            assert result.status_code == 302
-            assert result.headers["location"] == "/admin"
-        finally:
-            _restore_getter(original)
-
-    def test_auto_login_invalid_redirect_returns_400(self):
-        """Redirect path not starting with /admin should return 400."""
-        mock_settings = _mock_global_settings(api_key="test-key")
-        original = _patch_getter(mock_settings)
-        try:
-            with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(
-                    admin_routes.auto_login(
-                        key="test-key", redirect="https://evil.com"
-                    )
-                )
-            assert exc_info.value.status_code == 400
-            assert "Invalid redirect path" in exc_info.value.detail
-        finally:
-            _restore_getter(original)
-
-    def test_auto_login_redirect_to_admin_root(self):
-        """Redirect to /admin (exact match) should be allowed."""
-        mock_settings = _mock_global_settings(api_key="test-key")
-        original = _patch_getter(mock_settings)
-        try:
-            result = asyncio.run(
-                admin_routes.auto_login(key="test-key", redirect="/admin")
-            )
-            assert result.status_code == 302
-            assert result.headers["location"] == "/admin"
-        finally:
-            _restore_getter(original)
+    def test_logout_revokes_at_passport_and_clears_cookie(self):
+        passport = FakePassport()
+        request = MagicMock()
+        request.cookies.get.return_value = "passport-token"
+        response = MagicMock()
+        with (
+            patch.object(admin_routes, "passport_client", return_value=passport),
+            patch.object(admin_routes, "cookie_secure", return_value=False),
+        ):
+            result = asyncio.run(admin_routes.logout(request, response))
+        assert result == {"success": True}
+        assert passport.revoked == "passport-token"
+        response.delete_cookie.assert_called_once()
 
 
 class TestLoginPage:
@@ -146,12 +125,18 @@ class TestLoginPage:
         original = _patch_getter(mock_settings)
         try:
             mock_request = MagicMock()
-            with patch("omlx.admin.auth.verify_session", return_value=False):
+            mock_request.query_params.get.return_value = None
+            with (
+                patch.object(admin_routes, "verify_session", new=AsyncMock(return_value=False)),
+                patch.object(admin_routes, "passport_client", return_value=FakePassport()),
+            ):
                 with patch.object(admin_routes, "templates") as mock_templates:
                     mock_templates.TemplateResponse.return_value = MagicMock()
                     asyncio.run(admin_routes.login_page(request=mock_request))
                     mock_templates.TemplateResponse.assert_called_once_with(
-                        mock_request, "login.html", {"api_key_configured": True}
+                        mock_request,
+                        "login.html",
+                        {"passport_configured": True, "login_error": False},
                     )
         finally:
             _restore_getter(original)
@@ -230,182 +215,52 @@ class TestChatPageApiKeyInjection:
             admin_routes._get_global_settings = original
 
 
-class TestSkipAdminAuth:
-    """Tests for skipping admin auth when skip_api_key_verification is enabled."""
+class TestPassportVerification:
+    def test_require_admin_validates_with_passport_even_when_api_skip_is_enabled(self):
+        passport = FakePassport()
+        request = MagicMock()
+        request.cookies.get.return_value = "passport-token"
+        with (
+            patch.object(admin_auth, "passport_client", return_value=passport),
+            patch.object(admin_auth, "cookie_secure", return_value=False),
+        ):
+            assert asyncio.run(admin_auth.require_admin(request)) is True
+        assert passport.validated == "passport-token"
 
-    def _mock_gs(self, skip=True, host="127.0.0.1"):
-        mock = MagicMock()
-        mock.auth.skip_api_key_verification = skip
-        mock.server.host = host
-        return mock
-
-    def test_require_admin_skipped_on_localhost(self):
-        """require_admin should pass when skip_api_key_verification=True."""
-        gs = self._mock_gs(skip=True, host="127.0.0.1")
-        original = admin_auth._get_global_settings
-        admin_auth._get_global_settings = lambda: gs
-        try:
-            mock_request = MagicMock()
-            mock_request.cookies.get.return_value = None  # No session cookie
-            result = asyncio.run(admin_auth.require_admin(mock_request))
-            assert result is True
-        finally:
-            admin_auth._get_global_settings = original
-
-    def test_require_admin_skipped_on_any_host(self):
-        """require_admin should skip auth when skip_api_key_verification=True regardless of host."""
-        gs = self._mock_gs(skip=True, host="0.0.0.0")
-        original = admin_auth._get_global_settings
-        admin_auth._get_global_settings = lambda: gs
-        try:
-            mock_request = MagicMock()
-            mock_request.cookies.get.return_value = None
-            result = asyncio.run(admin_auth.require_admin(mock_request))
-            assert result is True
-        finally:
-            admin_auth._get_global_settings = original
-
-    def test_require_admin_not_skipped_when_disabled(self):
-        """require_admin should still require auth when skip_api_key_verification=False."""
-        gs = self._mock_gs(skip=False, host="127.0.0.1")
-        original = admin_auth._get_global_settings
-        admin_auth._get_global_settings = lambda: gs
-        try:
-            mock_request = MagicMock()
-            mock_request.cookies.get.return_value = None
-            mock_request.headers.get.return_value = "application/json"
+    def test_missing_passport_session_is_unauthorized(self):
+        request = MagicMock()
+        request.cookies.get.return_value = None
+        request.headers.get.return_value = "application/json"
+        with patch.object(admin_auth, "passport_client", return_value=FakePassport()):
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_auth.require_admin(mock_request))
-            assert exc_info.value.status_code == 401
+                asyncio.run(admin_auth.require_admin(request))
+        assert exc_info.value.status_code == 401
+
+    def test_native_machine_bearer_does_not_create_or_validate_a_session(self):
+        settings = _mock_global_settings(api_key="machine-key")
+        request = MagicMock()
+        request.headers.get.return_value = "Bearer machine-key"
+        original = admin_auth._get_global_settings
+        admin_auth._get_global_settings = lambda: settings
+        try:
+            with patch.object(admin_auth, "verify_session", new=AsyncMock()) as verify:
+                assert asyncio.run(admin_auth.require_admin(request)) is True
+                verify.assert_not_awaited()
         finally:
             admin_auth._get_global_settings = original
 
-    def test_login_page_redirects_when_skip_enabled(self):
-        """Login page should redirect to dashboard when skip is enabled on localhost."""
-        gs = MagicMock()
-        gs.auth.skip_api_key_verification = True
-        gs.auth.api_key = "test-key"
-        gs.server.host = "127.0.0.1"
-        original = _patch_getter(gs)
-        try:
-            mock_request = MagicMock()
-            with patch("omlx.admin.auth.verify_session", return_value=False):
-                result = asyncio.run(admin_routes.login_page(request=mock_request))
-                assert result.status_code == 302
-                assert result.headers["location"] == "/admin/dashboard"
-        finally:
-            _restore_getter(original)
+    def test_init_auth_requires_owner_only_secret_file(self, tmp_path, monkeypatch):
+        secret = tmp_path / "passport.secret"
+        secret.write_text("s" * 32, encoding="ascii")
+        secret.chmod(0o600)
+        monkeypatch.setenv("OMLX_PASSPORT_CLIENT_SECRET_FILE", str(secret))
+        admin_auth.init_auth()
+        assert admin_auth.passport_client() is not None
+        assert admin_auth.passport_client().client_origin == "http://localhost:8000"
 
-
-class TestInitAuth:
-    """Tests for init_auth() persistent secret key initialization."""
-
-    def test_init_auth_sets_serializer(self):
-        """init_auth should update the serializer with the provided key."""
-        original_serializer = admin_auth._serializer
-        try:
-            admin_auth.init_auth("test-persistent-secret-key")
-            # Create a token with the new serializer
-            token = admin_auth.create_session_token()
-            assert admin_auth.verify_session_token(token) is True
-        finally:
-            admin_auth._serializer = original_serializer
-
-    def test_init_auth_env_var_takes_priority(self):
-        """OMLX_SECRET_KEY env var should take priority over provided key."""
-        original_serializer = admin_auth._serializer
-        original_secret = admin_auth.SECRET_KEY
-        try:
-            with patch.dict("os.environ", {"OMLX_SECRET_KEY": "env-secret-key"}):
-                admin_auth.init_auth("settings-secret-key")
-                assert admin_auth.SECRET_KEY == "env-secret-key"
-        finally:
-            admin_auth._serializer = original_serializer
-            admin_auth.SECRET_KEY = original_secret
-
-    def test_init_auth_uses_provided_key_when_no_env(self):
-        """Should use provided key when no OMLX_SECRET_KEY env var."""
-        original_serializer = admin_auth._serializer
-        original_secret = admin_auth.SECRET_KEY
-        try:
-            with patch.dict("os.environ", {}, clear=True):
-                # Remove OMLX_SECRET_KEY if it exists
-                import os
-
-                os.environ.pop("OMLX_SECRET_KEY", None)
-                admin_auth.init_auth("my-persistent-key")
-                assert admin_auth.SECRET_KEY == "my-persistent-key"
-        finally:
-            admin_auth._serializer = original_serializer
-            admin_auth.SECRET_KEY = original_secret
-
-    def test_tokens_survive_reinit_with_same_key(self):
-        """Tokens created before re-init should still be valid with same key."""
-        original_serializer = admin_auth._serializer
-        original_secret = admin_auth.SECRET_KEY
-        try:
-            key = "persistent-key-for-test"
-            admin_auth.init_auth(key)
-            token = admin_auth.create_session_token()
-
-            # Re-initialize with same key (simulates server restart)
-            admin_auth.init_auth(key)
-            assert admin_auth.verify_session_token(token) is True
-        finally:
-            admin_auth._serializer = original_serializer
-            admin_auth.SECRET_KEY = original_secret
-
-    def test_tokens_invalid_after_reinit_with_different_key(self):
-        """Tokens should be invalid after re-init with a different key."""
-        original_serializer = admin_auth._serializer
-        original_secret = admin_auth.SECRET_KEY
-        try:
-            admin_auth.init_auth("key-one")
-            token = admin_auth.create_session_token()
-
-            admin_auth.init_auth("key-two")
-            assert admin_auth.verify_session_token(token) is False
-        finally:
-            admin_auth._serializer = original_serializer
-            admin_auth.SECRET_KEY = original_secret
-
-
-class TestRememberMe:
-    """Tests for remember me session token functionality."""
-
-    def test_create_token_default_no_remember(self):
-        """Default token should not have remember flag."""
-        token = admin_auth.create_session_token()
-        # Verify it works with default max_age
-        assert admin_auth.verify_session_token(token) is True
-
-    def test_create_token_with_remember(self):
-        """Token with remember=True should be valid."""
-        token = admin_auth.create_session_token(remember=True)
-        assert admin_auth.verify_session_token(token) is True
-
-    def test_remember_token_has_extended_max_age(self):
-        """Remember token should use 30-day max_age for verification."""
-        token = admin_auth.create_session_token(remember=True)
-        # Manually load the payload to check the remember flag
-        data = admin_auth._serializer.loads(token, max_age=None)
-        assert data["remember"] is True
-        assert data["admin"] is True
-
-    def test_non_remember_token_payload(self):
-        """Non-remember token should have remember=False in payload."""
-        token = admin_auth.create_session_token(remember=False)
-        data = admin_auth._serializer.loads(token, max_age=None)
-        assert data["remember"] is False
-        assert data["admin"] is True
-
-    def test_remember_me_max_age_constant(self):
-        """REMEMBER_ME_MAX_AGE should be 30 days."""
-        assert admin_auth.REMEMBER_ME_MAX_AGE == 2592000  # 30 * 24 * 60 * 60
-
-    def test_session_max_age_constant(self):
-        """SESSION_MAX_AGE should be 24 hours."""
-        assert admin_auth.SESSION_MAX_AGE == 86400  # 24 * 60 * 60
+        secret.chmod(0o644)
+        with pytest.raises(PassportClientError):
+            admin_auth.init_auth()
 
 
 # =============================================================================

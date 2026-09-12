@@ -33,12 +33,6 @@ class TestAdminStatsAccessFilter:
         )
         assert self.filter.filter(record) is False
 
-    def test_suppresses_admin_login(self):
-        record = self._make_record(
-            '127.0.0.1 - "POST /admin/api/login HTTP/1.1" 200'
-        )
-        assert self.filter.filter(record) is False
-
     def test_allows_other_requests(self):
         record = self._make_record('127.0.0.1 - "GET /v1/models HTTP/1.1" 200')
         assert self.filter.filter(record) is True

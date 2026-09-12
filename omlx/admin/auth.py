@@ -1,113 +1,74 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Authentication utilities for the oMLX admin panel.
-
-This module provides session-based authentication using signed tokens
-and API key verification for admin panel access.
-"""
+"""Passport browser authentication and machine API-key utilities."""
 
 import hashlib
 import os
+from pathlib import Path
 import secrets
+import stat
 from typing import Optional
 
 from fastapi import HTTPException, Request
-from fastapi.responses import RedirectResponse
-from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-
-# Session configuration
-SESSION_COOKIE_NAME = "omlx_admin_session"
-SESSION_MAX_AGE = 86400  # 24 hours in seconds
-REMEMBER_ME_MAX_AGE = 2592000  # 30 days in seconds
-
-# Secret key for signing session tokens
-# Use environment variable if set, otherwise generate a random key
-# Note: Random key means sessions won't persist across server restarts
-# This is a fallback; init_auth() should be called with a persistent key
-SECRET_KEY = os.environ.get("OMLX_SECRET_KEY") or secrets.token_hex(32)
-
-# Initialize the serializer for creating and verifying session tokens
-_serializer = URLSafeTimedSerializer(SECRET_KEY)
+from floated_claim.passport_exchange import (
+    PassportClientError,
+    PassportExchangeClient,
+    delete_service_session_cookie,
+    service_session_cookie_name,
+    set_service_session_cookie,
+)
 
 # Global settings getter (set by init_auth)
 _get_global_settings = None
+_passport_client: PassportExchangeClient | None = None
 
 
-def init_auth(secret_key: str, global_settings_getter=None) -> None:
-    """Initialize authentication with a persistent secret key.
-
-    Should be called during server startup with the secret key from settings.
-    Environment variable OMLX_SECRET_KEY takes priority if set.
-
-    Args:
-        secret_key: The secret key from settings.json for signing tokens.
-        global_settings_getter: Optional callable that returns GlobalSettings.
-    """
-    global _serializer, SECRET_KEY, _get_global_settings
-    # Environment variable takes priority over settings
-    key = os.environ.get("OMLX_SECRET_KEY") or secret_key
-    SECRET_KEY = key
-    _serializer = URLSafeTimedSerializer(key)
-    if global_settings_getter is not None:
-        _get_global_settings = global_settings_getter
-
-
-def create_session_token(remember: bool = False) -> str:
-    """Create a signed session token for admin authentication.
-
-    Args:
-        remember: If True, the token payload includes a remember flag
-                  for extended session duration (30 days).
-
-    Returns:
-        A URL-safe signed token string containing admin session data.
-
-    Example:
-        >>> token = create_session_token()
-        >>> verify_session_token(token)
-        True
-    """
-    payload = {"admin": True, "remember": remember}
-    return _serializer.dumps(payload)
-
-
-def verify_session_token(token: str, max_age: int = SESSION_MAX_AGE) -> bool:
-    """Verify and decode a session token.
-
-    The max_age is determined by the token's remember flag:
-    - remember=True: 30 days
-    - remember=False (default): 24 hours
-
-    Args:
-        token: The signed session token to verify.
-        max_age: Maximum age of the token in seconds. Defaults to 24 hours.
-                 This is overridden by the token's remember flag.
-
-    Returns:
-        True if the token is valid and not expired, False otherwise.
-
-    Example:
-        >>> token = create_session_token()
-        >>> verify_session_token(token)
-        True
-        >>> verify_session_token("invalid_token")
-        False
-    """
+def _client_config() -> dict[str, str]:
+    secret_file = os.environ.get(
+        "OMLX_PASSPORT_CLIENT_SECRET_FILE",
+        str(Path.home() / ".omlx" / "passport-client.secret"),
+    )
+    path = Path(secret_file).expanduser()
     try:
-        # First load without max_age check to read the remember flag
-        data = _serializer.loads(token, max_age=None)
-        if data.get("admin", False) is not True:
-            return False
+        mode = path.stat().st_mode
+    except OSError:
+        return {}
+    if mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise PassportClientError()
+    return {
+        "PASSPORT_AUTH_ORIGIN": os.environ.get(
+            "OMLX_PASSPORT_ORIGIN", "https://id.bunrin.work"
+        ),
+        "PASSPORT_AUTH_CLIENT_ID": os.environ.get(
+            "OMLX_PASSPORT_CLIENT_ID", "omlx"
+        ),
+        "PASSPORT_AUTH_CLIENT_ORIGIN": os.environ.get(
+            "OMLX_PASSPORT_CLIENT_ORIGIN", "http://localhost:8000"
+        ),
+        "PASSPORT_AUTH_CLIENT_SECRET_FILE": str(path),
+    }
 
-        # Determine the appropriate max_age based on remember flag
-        effective_max_age = (
-            REMEMBER_ME_MAX_AGE if data.get("remember", False) else max_age
-        )
 
-        # Re-validate with the correct max_age
-        data = _serializer.loads(token, max_age=effective_max_age)
-        return data.get("admin", False) is True
-    except (BadSignature, SignatureExpired):
-        return False
+def init_auth(global_settings_getter=None) -> None:
+    """Load the server-only Passport client without creating a local issuer."""
+    global _get_global_settings, _passport_client
+    _get_global_settings = global_settings_getter
+    config = _client_config()
+    _passport_client = PassportExchangeClient.from_config(config) if config else None
+
+
+def passport_client() -> PassportExchangeClient | None:
+    return _passport_client
+
+
+def cookie_secure() -> bool:
+    return bool(_passport_client and _passport_client.client_origin.startswith("https://"))
+
+
+def safe_admin_path(value: str | None) -> str:
+    if (not value or not value.startswith("/admin") or value.startswith("//")
+            or "\\" in value or "\r" in value or "\n" in value):
+        return "/admin/dashboard"
+    return value
 
 
 def compare_keys(provided_key: str, expected_key: str) -> bool:
@@ -237,21 +198,22 @@ def validate_api_key(api_key: str) -> tuple[bool, str]:
     return True, ""
 
 
-def verify_session(request: Request) -> bool:
-    """Verify if the request has a valid admin session.
-
-    Checks for a valid session cookie in the request.
-
-    Args:
-        request: The FastAPI request object.
-
-    Returns:
-        True if the session is valid, False otherwise.
-    """
-    token = request.cookies.get(SESSION_COOKIE_NAME)
+async def verify_session(request: Request) -> bool:
+    """Ask Passport for the current client-bound authorization decision."""
+    client = passport_client()
+    if client is None:
+        return False
+    token = request.cookies.get(service_session_cookie_name(secure=cookie_secure()))
     if not token:
         return False
-    return verify_session_token(token)
+    try:
+        session = await client.validate_session(token=token)
+    except PassportClientError:
+        return False
+    if not session.authorized:
+        return False
+    request.state.passport_session = session
+    return True
 
 
 async def require_admin(request: Request) -> bool:
@@ -275,13 +237,16 @@ async def require_admin(request: Request) -> bool:
         ... async def get_settings(is_admin: bool = Depends(require_admin)):
         ...     return {"settings": "..."}
     """
-    # Skip admin auth when skip_api_key_verification is enabled
-    if _get_global_settings is not None:
-        gs = _get_global_settings()
-        if gs is not None and gs.auth.skip_api_key_verification:
-            return True
-
-    if not verify_session(request):
+    authorization = request.headers.get("authorization", "")
+    machine_authorized = False
+    if authorization.startswith("Bearer ") and _get_global_settings is not None:
+        settings = _get_global_settings()
+        configured = settings.auth.api_key if settings is not None else None
+        supplied = authorization[len("Bearer "):].strip()
+        machine_authorized = bool(
+            configured and supplied and verify_api_key(supplied, configured)
+        )
+    if not machine_authorized and not await verify_session(request):
         # Browser requests (Accept: text/html) get redirected to login page
         accept = request.headers.get("accept", "")
         if "text/html" in accept:

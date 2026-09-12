@@ -9,11 +9,9 @@
 // for the RFC 5737 documentation range (192.0.2.x).
 //
 // To re-capture (e.g., after intentional server-side wire changes):
-//   PORT=<port> KEY=<api-key> COOKIES=$(mktemp)
-//   curl -s -c "$COOKIES" -X POST "http://127.0.0.1:$PORT/admin/api/login" \
-//        -H "Content-Type: application/json" \
-//        -d "{\"api_key\":\"$KEY\",\"remember\":true}"
-//   curl -s -b "$COOKIES" "http://127.0.0.1:$PORT/admin/api/<endpoint>" \
+//   PORT=<port> KEY=<api-key>
+//   curl -s -H "Authorization: Bearer $KEY" \
+//        "http://127.0.0.1:$PORT/admin/api/<endpoint>" \
 //        | python3 -m json.tool > Fixtures/<name>.json
 // Then re-sanitize before committing.
 

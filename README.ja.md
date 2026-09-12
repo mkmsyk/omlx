@@ -302,10 +302,13 @@ omlx serve --model-dir ~/models --mcp-config mcp.json
 
 # APIキー認証
 omlx serve --model-dir ~/models --api-key your-secret-key
-# Localhost専用: 管理画面のグローバル設定で検証をスキップ
+# Localhost専用: 管理画面のグローバル設定で機械APIの検証をスキップ
 ```
 
-すべての設定は`/admin`のWeb管理画面からも設定できます。設定は`~/.omlx/settings.json`に保存され、CLIフラグが優先されます。
+APIキーはネイティブアプリを含む機械クライアントの認証だけに使い、ブラウザsessionは発行しません。
+`/admin`のWeb管理画面はBunrin Passportだけでログインします。所有者だけが読めるclient credentialを
+`~/.omlx/passport-client.secret`へ置くか、`OMLX_PASSPORT_CLIENT_SECRET_FILE`を指定します。
+設定は`~/.omlx/settings.json`に保存され、CLIフラグが優先されます。
 
 <details>
 <summary>アーキテクチャ</summary>

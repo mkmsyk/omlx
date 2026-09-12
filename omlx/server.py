@@ -738,11 +738,9 @@ def _openai_error_body(message, status_code: int, param=None, code=None) -> dict
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: FastAPIRequest, exc: HTTPException):
     """Log all HTTP errors (4xx/5xx) before returning the response."""
-    # Admin session expiry from dashboard polling — not worth logging.
-    # But keep /admin/api/login 401s visible (possible brute force attempts).
+    # Passport session expiry from dashboard polling is not worth logging.
     _is_admin_session_expiry = (
         request.url.path.startswith("/admin/")
-        and request.url.path != "/admin/api/login"
         and exc.status_code == 401
     )
     if not _is_admin_session_expiry:
@@ -1902,19 +1900,11 @@ def init_server(
 
     _refresh_i18n_globals()
 
-    # Initialize auth with persistent secret key
+    # Initialize the external Passport verifier. oMLX never signs sessions.
     if global_settings:
-        if not global_settings.auth.secret_key:
-            import secrets as _secrets
-
-            global_settings.auth.secret_key = _secrets.token_hex(32)
-            global_settings.save()
-            logger.info("Generated and saved new auth secret key")
         from .admin.auth import init_auth
 
-        init_auth(
-            global_settings.auth.secret_key, lambda: _server_state.global_settings
-        )
+        init_auth(lambda: _server_state.global_settings)
 
     # Configure CORS middleware from settings
     cors_origins = global_settings.server.cors_origins if global_settings else ["*"]

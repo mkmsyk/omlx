@@ -5,7 +5,7 @@
 //                Routes through /admin/api/setup-api-key for first-time
 //                setup, and /admin/api/global-settings (`api_key` field)
 //                for updates to an already-configured key.
-//   • Authentication — `skip_api_key_verification` toggle (no-auth mode)
+//   • Machine API authentication — `skip_api_key_verification` toggle
 //   • Sub Keys — list + create + delete via /admin/api/sub-keys (POST/DELETE)
 //
 // The main key is rendered as a SecureField with an explicit show toggle
@@ -51,7 +51,7 @@ private struct APIKeySection: View {
                    defaultValue: "API Key",
                    comment: "Section header for the API key editor"),
             subtitle: String(localized: "security.section.api_key.sub",
-                             defaultValue: "Required to authenticate /v1 requests and admin sessions",
+                             defaultValue: "Required for /v1 and native app machine requests",
                              comment: "Subtitle for the API key section header")
         )
 
@@ -90,7 +90,7 @@ private struct APIKeyEditorRow: View {
     private var sublabel: String {
         vm.apiKeySet
             ? String(localized: "security.api_key.sublabel.set",
-                     defaultValue: "Used to authenticate /v1 and admin requests. ≥ 4 printable chars, no whitespace.",
+                     defaultValue: "Used for /v1 and native app machine requests. ≥ 4 printable chars, no whitespace.",
                      comment: "Sublabel below the API key field when a key is already configured")
             : String(localized: "security.api_key.sublabel.unset",
                      defaultValue: "Set one before exposing the server. ≥ 4 printable chars, no whitespace.",

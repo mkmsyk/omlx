@@ -353,10 +353,13 @@ omlx serve --model-dir ~/models --hf-endpoint https://hf-mirror.com
 
 # API key authentication
 omlx serve --model-dir ~/models --api-key your-secret-key
-# Localhost-only: skip verification via admin panel global settings
+# Localhost-only: skip machine API verification via admin panel global settings
 ```
 
-All settings can also be configured from the web admin panel at `/admin`. Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
+API keys authenticate machine clients, including the native app; they never create a browser session.
+The web admin at `/admin` uses Bunrin Passport exclusively. Place its owner-only client
+credential at `~/.omlx/passport-client.secret` (or set `OMLX_PASSPORT_CLIENT_SECRET_FILE`).
+Settings are persisted to `~/.omlx/settings.json`, and CLI flags take precedence.
 
 <details>
 <summary>Architecture</summary>

@@ -8713,7 +8713,7 @@
       }
     },
     "menubar.item.web_dashboard" : {
-      "comment" : "Menubar item that opens the browser-based web admin dashboard with auto-login",
+      "comment" : "Menubar item that opens the Passport-backed web admin dashboard",
       "extractionState" : "manual",
       "localizations" : {
         "en" : {
@@ -16557,7 +16557,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Used to authenticate /v1 and admin requests. ≥ 4 printable chars, no whitespace."
+            "value" : "Used for /v1 and native app machine requests. ≥ 4 printable chars, no whitespace."
           }
         },
         "ru" : {
@@ -16677,7 +16677,7 @@
         "en" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Required to authenticate /v1 requests and admin sessions"
+            "value" : "Required for /v1 and native app machine requests"
           }
         },
         "ru" : {

@@ -4,8 +4,8 @@
 // NotificationCenter posts so the menubar refreshes without polling state
 // itself.
 //
-// PR 7's OMLXClient will absorb this auth machinery; for now the poller owns
-// its own URLSession + cookie jar to keep the menubar self-contained.
+// The poller is a native machine client: it sends the configured API key as
+// Bearer and never exchanges it for a browser session.
 
 import Foundation
 
@@ -256,16 +256,8 @@ final class MenubarStatsPoller {
         self.idleInterval = interval
 
         let cfg = sessionConfiguration ?? URLSessionConfiguration.default
-        // `HTTPCookieStorage()` returns a detached instance that never
-        // actually persists cookies, so the post-login session cookie was
-        // dropped and every subsequent /api/stats request 401-ed. Since
-        // FastAPI's 401 body still JSON-decodes into our all-Optional Stats
-        // struct (all keys missing → all fields nil), the menubar rendered
-        // "—" everywhere with no error trail. Use the process-wide shared
-        // jar — matches OMLXClient and inherits its login session.
-        cfg.httpCookieStorage = HTTPCookieStorage.shared
-        cfg.httpShouldSetCookies = true
-        cfg.httpCookieAcceptPolicy = .always
+        cfg.httpCookieStorage = nil
+        cfg.httpShouldSetCookies = false
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         cfg.timeoutIntervalForRequest = 5.0
         self.session = URLSession(configuration: cfg)
@@ -397,14 +389,8 @@ final class MenubarStatsPoller {
         )
         var req = URLRequest(url: url)
         req.setValue("application/json", forHTTPHeaderField: "Accept")
+        setMachineAuthorization(on: &req)
         let (data, response) = try await session.data(for: req)
-
-        if let http = response as? HTTPURLResponse, http.statusCode == 401 {
-            try await login()
-            let (data2, response2) = try await session.data(for: req)
-            try validateOK(response2)
-            return try JSONDecoder().decode(Stats.self, from: data2)
-        }
         try validateOK(response)
         return try JSONDecoder().decode(Stats.self, from: data)
     }
@@ -413,28 +399,16 @@ final class MenubarStatsPoller {
         let url = try makeURL(path: "/admin/api/activity")
         var req = URLRequest(url: url)
         req.setValue("application/json", forHTTPHeaderField: "Accept")
+        setMachineAuthorization(on: &req)
         let (data, response) = try await session.data(for: req)
-
-        if let http = response as? HTTPURLResponse, http.statusCode == 401 {
-            try await login()
-            let (authenticatedData, authenticatedResponse) = try await session.data(for: req)
-            try validateOK(authenticatedResponse)
-            return try JSONDecoder().decode(Stats.self, from: authenticatedData)
-        }
         try validateOK(response)
         return try JSONDecoder().decode(Stats.self, from: data)
     }
 
-    private func login() async throws {
-        guard let apiKey, !apiKey.isEmpty else {
-            throw URLError(.userAuthenticationRequired)
+    private func setMachineAuthorization(on request: inout URLRequest) {
+        if let key = apiKey, !key.isEmpty {
+            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         }
-        var req = URLRequest(url: try makeURL(path: "/admin/api/login"))
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try JSONEncoder().encode(["api_key": apiKey])
-        let (_, response) = try await session.data(for: req)
-        try validateOK(response)
     }
 
     private var hasAPIKey: Bool {

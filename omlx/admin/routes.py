@@ -2,7 +2,7 @@
 """Admin panel routes for oMLX server configuration.
 
 This module provides HTTP routes for the admin panel including:
-- Login/logout with API key authentication
+- Login/logout with Bunrin Passport authentication
 - Dashboard for server monitoring
 - Model settings management (per-model sampling parameters, pinning, default)
 - Global settings management
@@ -48,11 +48,15 @@ from ..websearch import (
 )
 from ..websearch import SUPPORTED_PROVIDERS as SUPPORTED_WEB_SEARCH_PROVIDERS
 from .auth import (
-    REMEMBER_ME_MAX_AGE,
-    SESSION_MAX_AGE,
+    PassportClientError,
+    cookie_secure,
     compare_keys,
-    create_session_token,
+    delete_service_session_cookie,
+    passport_client,
     require_admin,
+    safe_admin_path,
+    service_session_cookie_name,
+    set_service_session_cookie,
     validate_api_key,
     verify_api_key,
     verify_session,
@@ -66,13 +70,6 @@ PRESET_REMOTE_URL = "https://omlx.ai/assets/omlx_preset.json"
 # =============================================================================
 # Pydantic Models
 # =============================================================================
-
-
-class LoginRequest(BaseModel):
-    """Request model for admin login."""
-
-    api_key: str
-    remember: bool = False
 
 
 class SetupApiKeyRequest(BaseModel):
@@ -1436,32 +1433,16 @@ def get_system_memory_info() -> dict:
 @router.get("", response_class=HTMLResponse)
 @router.get("/", response_class=HTMLResponse)
 async def login_page(request: Request):
-    """
-    Render the admin login page or setup page.
-
-    If no API key is configured, the page will show the initial setup form.
-    Otherwise, it shows the standard login form.
-
-    Returns:
-        HTML login/setup page.
-    """
-    # Redirect to dashboard if already authenticated
-    from .auth import verify_session
-
-    if verify_session(request):
+    """Render the Passport login entry or redirect an authorized browser."""
+    if await verify_session(request):
         return RedirectResponse(url="/admin/dashboard", status_code=302)
-
-    global_settings = _get_global_settings()
-
-    # Skip login page when skip_api_key_verification is enabled
-    if global_settings is not None and global_settings.auth.skip_api_key_verification:
-        return RedirectResponse(url="/admin/dashboard", status_code=302)
-
-    api_key_configured = bool(global_settings and global_settings.auth.api_key)
     return templates.TemplateResponse(
         request,
         "login.html",
-        {"api_key_configured": api_key_configured},
+        {
+            "passport_configured": passport_client() is not None,
+            "login_error": request.query_params.get("error") == "passport",
+        },
     )
 
 
@@ -1523,68 +1504,50 @@ async def admin_static(path: str):
 # =============================================================================
 
 
-@router.post("/api/login")
-async def login(request: LoginRequest, response: Response):
-    """
-    Authenticate with API key and create session.
-
-    Requires an API key to be configured on the server. If no API key
-    is configured, returns 400 directing the user to set one up first.
-
-    Args:
-        request: LoginRequest containing the API key.
-        response: FastAPI response object for setting cookies.
-
-    Returns:
-        JSON response with success status.
-
-    Raises:
-        HTTPException: 400 if no API key configured, 401 if invalid.
-    """
-    global_settings = _get_global_settings()
-    server_api_key = global_settings.auth.api_key if global_settings else None
-
-    # Reject login if no API key is configured (must use setup first)
-    if not server_api_key:
-        raise HTTPException(
-            status_code=400,
-            detail="No API key configured. Please set up an API key first.",
-        )
-
-    # Main key only — sub keys must not grant admin login
-    if not verify_api_key(request.api_key, server_api_key):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API key",
-        )
-
-    # Create session token and set cookie
-    token = create_session_token(remember=request.remember)
-    cookie_max_age = REMEMBER_ME_MAX_AGE if request.remember else SESSION_MAX_AGE
-    response.set_cookie(
-        key="omlx_admin_session",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=cookie_max_age,
+@router.get("/auth/passport")
+async def passport_login(next: str = "/admin/dashboard"):
+    """Start login only through the registered Bunrin Passport client."""
+    client = passport_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="Passport is not configured")
+    return RedirectResponse(
+        url=client.login_url(next_path=safe_admin_path(next)), status_code=302
     )
 
-    return {"success": True}
+
+@router.get("/auth/passport/callback")
+async def passport_callback(ticket: str = "", next: str = "/admin/dashboard"):
+    """Redeem a one-time ticket and relay Passport's opaque service token."""
+    client = passport_client()
+    if client is None:
+        raise HTTPException(status_code=503, detail="Passport is not configured")
+    try:
+        session = await client.redeem_ticket(ticket=ticket)
+    except PassportClientError:
+        return RedirectResponse(url="/admin?error=passport", status_code=302)
+    if not session.authorized:
+        return RedirectResponse(url="/admin?error=passport", status_code=302)
+    response = RedirectResponse(url=safe_admin_path(next), status_code=302)
+    set_service_session_cookie(
+        response,
+        session.token,
+        secure=cookie_secure(),
+        expires_at=session.expires_at,
+    )
+    return response
 
 
 @router.post("/api/setup-api-key")
-async def setup_api_key(request: SetupApiKeyRequest, response: Response):
+async def setup_api_key(request: SetupApiKeyRequest):
     """
     Set up the initial API key when none is configured.
 
-    This endpoint is only available when no API key is currently set.
-    After successful setup, a session is created so the user is
-    immediately logged in.
+    This endpoint is only available when no machine API key is currently set.
+    It configures a stateless machine credential and never issues a browser
+    session.
 
     Args:
         request: SetupApiKeyRequest with api_key and api_key_confirm.
-        response: FastAPI response object for setting cookies.
-
     Returns:
         JSON response with success status.
 
@@ -1624,69 +1587,22 @@ async def setup_api_key(request: SetupApiKeyRequest, response: Response):
 
     logger.info("API key configured via initial setup")
 
-    # Create session token and set cookie (auto-login after setup)
-    token = create_session_token()
-    response.set_cookie(
-        key="omlx_admin_session",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=86400,  # 24 hours
-    )
-
     return {"success": True, "message": "API key configured successfully"}
 
 
 @router.post("/api/logout")
-async def logout(response: Response):
-    """
-    Clear session cookie and logout.
-
-    Args:
-        response: FastAPI response object for clearing cookies.
-
-    Returns:
-        JSON response with success status.
-    """
-    response.delete_cookie(key="omlx_admin_session")
+async def logout(request: Request, response: Response):
+    """Revoke at Passport, then clear oMLX's host-only relay cookie."""
+    client = passport_client()
+    secure = cookie_secure()
+    token = request.cookies.get(service_session_cookie_name(secure=secure))
+    if client is not None and token:
+        try:
+            await client.revoke_session(token=token)
+        except PassportClientError:
+            pass
+    delete_service_session_cookie(response, secure=secure)
     return {"success": True}
-
-
-@router.get("/auto-login")
-async def auto_login(key: str = "", redirect: str = "/admin/dashboard"):
-    """
-    Auto-login using API key and redirect to the target admin page.
-
-    Used by the macOS menubar app to open admin pages with automatic
-    authentication, bypassing the manual login form.
-
-    Args:
-        key: The API key for authentication.
-        redirect: The path to redirect to after login. Must start with /admin.
-
-    Returns:
-        HTTP 302 redirect with session cookie set.
-    """
-    if not redirect.startswith("/admin"):
-        raise HTTPException(status_code=400, detail="Invalid redirect path")
-
-    global_settings = _get_global_settings()
-    server_api_key = global_settings.auth.api_key if global_settings else None
-
-    # Main key only — sub keys must not grant admin login
-    if not key or not server_api_key or not verify_api_key(key, server_api_key):
-        return RedirectResponse(url="/admin", status_code=302)
-
-    token = create_session_token()
-    response = RedirectResponse(url=redirect, status_code=302)
-    response.set_cookie(
-        key="omlx_admin_session",
-        value=token,
-        httponly=True,
-        samesite="lax",
-        max_age=86400,
-    )
-    return response
 
 
 # =============================================================================
@@ -2124,8 +2040,8 @@ async def _require_admin_or_bearer(request: Request) -> bool:
     if gs is not None and gs.auth.skip_api_key_verification:
         return True
 
-    # Valid admin session cookie
-    if verify_session(request):
+    # Valid Passport browser session
+    if await verify_session(request):
         return True
 
     # Bearer token matching the configured API key

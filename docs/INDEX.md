@@ -5,12 +5,15 @@
 | 文書 | 内容 |
 |---|---|
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 開発参加、テスト、コード構成の案内 |
+| [oMLX総則](omlx/omlx.md) | 製品境界と認証区分 |
+| [Passport認証仕様](omlx/omlx-passport-auth.spec.md) | browser sessionと機械credentialの境界 |
 
 ## 内部作業ログ
 
 | 文書 | 内容 |
 |---|---|
 | [管理画面アクティブモデル一覧の未コミット変更](internal/session-active-model-visibility-20260906.md) | 非表示モデルの一覧除外修正と検証結果 |
+| [oMLX人間sessionのPassport一元化](internal/session-passport-auth-20260912.md) | 管理画面とネイティブアプリの認証経路変更 |
 
 [管制管理下のprefill退避](internal/session-managed-prefill-20260910.md)。
 

@@ -1,5 +1,6 @@
-// PR 7 — async HTTP client for /admin/api/*. Cookie-jar session, JSON in/out,
-// auto-login on 401 if an API key is configured.
+// PR 7 — async HTTP client for /admin/api/*. The native app uses the main
+// machine API key directly as a Bearer credential; browser sessions belong
+// exclusively to Bunrin Passport.
 //
 // The client is host/port-mutable (when the user changes Listen Address or
 // Port in ServerScreen we re-point it without rebuilding the URLSession). It
@@ -51,9 +52,8 @@ final class OMLXClient: ObservableObject {
         self.apiKey = apiKey
 
         let cfg = URLSessionConfiguration.default
-        cfg.httpCookieStorage = HTTPCookieStorage.shared
-        cfg.httpShouldSetCookies = true
-        cfg.httpCookieAcceptPolicy = .always
+        cfg.httpCookieStorage = nil
+        cfg.httpShouldSetCookies = false
         cfg.timeoutIntervalForRequest = 15
         cfg.requestCachePolicy = .reloadIgnoringLocalCacheData
         self.session = URLSession(configuration: cfg)
@@ -542,8 +542,7 @@ final class OMLXClient: ObservableObject {
         _ method: String,
         path: String,
         query: [URLQueryItem] = [],
-        body: Data?,
-        isRetry: Bool = false
+        body: Data?
     ) async throws -> T {
         var components = URLComponents()
         components.scheme = "http"
@@ -556,6 +555,9 @@ final class OMLXClient: ObservableObject {
         var req = URLRequest(url: url)
         req.httpMethod = method
         req.setValue("application/json", forHTTPHeaderField: "Accept")
+        if let key = apiKey, !key.isEmpty {
+            req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
         if body != nil {
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = body
@@ -563,14 +565,6 @@ final class OMLXClient: ObservableObject {
 
         let (data, resp) = try await session.data(for: req)
         guard let http = resp as? HTTPURLResponse else { throw OMLXClientError.invalidResponse }
-
-        if http.statusCode == 401, !isRetry {
-            guard let key = apiKey, !key.isEmpty else {
-                throw OMLXClientError.unauthenticated
-            }
-            try await login(apiKey: key)
-            return try await request(method, path: path, query: query, body: body, isRetry: true)
-        }
 
         guard 200..<300 ~= http.statusCode else {
             let bodyStr = String(data: data, encoding: .utf8)
@@ -583,27 +577,6 @@ final class OMLXClient: ObservableObject {
         return try decoder.decode(T.self, from: data)
     }
 
-    private func login(apiKey: String) async throws {
-        struct LoginReq: Encodable { let apiKey: String; let remember: Bool }
-        var components = URLComponents()
-        components.scheme = "http"
-        components.host = host
-        components.port = port
-        components.path = "/admin/api/login"
-        guard let url = components.url else { throw OMLXClientError.invalidURL }
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try encoder.encode(LoginReq(apiKey: apiKey, remember: true))
-
-        let (data, resp) = try await session.data(for: req)
-        guard let http = resp as? HTTPURLResponse else { throw OMLXClientError.invalidResponse }
-        guard 200..<300 ~= http.statusCode else {
-            let bodyStr = String(data: data, encoding: .utf8)
-            throw OMLXClientError.http(status: http.statusCode, body: bodyStr)
-        }
-    }
 }
 
 struct EmptyResponse: Decodable {}

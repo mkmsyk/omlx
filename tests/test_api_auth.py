@@ -313,41 +313,7 @@ class TestSkipApiKeyVerification:
 
 
 class TestAdminAuth:
-    """Tests for admin authentication functions."""
-
-    def test_create_session_token(self):
-        """Test session token creation."""
-        from omlx.admin.auth import create_session_token
-
-        token = create_session_token()
-        assert token is not None
-        assert isinstance(token, str)
-        assert len(token) > 0
-
-    def test_verify_session_token_valid(self):
-        """Test valid session token verification."""
-        from omlx.admin.auth import create_session_token, verify_session_token
-
-        token = create_session_token()
-        assert verify_session_token(token) is True
-
-    def test_verify_session_token_invalid(self):
-        """Test invalid session token verification."""
-        from omlx.admin.auth import verify_session_token
-
-        assert verify_session_token("invalid-token") is False
-
-    def test_verify_session_token_expired(self):
-        """Test expired session token verification."""
-        from omlx.admin.auth import create_session_token, verify_session_token
-        import time
-
-        token = create_session_token()
-        # Wait a moment and verify with very short max_age
-        time.sleep(0.1)
-        # With max_age=0, token should be expired after any delay
-        # Note: itsdangerous rounds to nearest second, so we use a small delay
-        assert verify_session_token(token, max_age=-1) is False
+    """Tests for machine API-key utilities kept separate from Passport."""
 
     def test_verify_api_key_constant_time(self):
         """Test that API key comparison uses constant time."""
