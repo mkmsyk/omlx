@@ -22,4 +22,14 @@ Passportを唯一の人間向けsession発行・検証・失効元とし、機�
   更新し、対象試験で成功を再確認した。
 - Swift全試験は297件を実行できたが、既存のLocalization smoke 40件がcatalog sentinel欠落で失敗した。
   変更対象のmenubar URL／pollerを含む選択試験28件は成功した。
-- 導入済みアプリからのbrowser login・callback・logout、機械Bearer動作、配備版は配備後に追記する。
+- Release 0.6.4をbuildし、埋込PythonのMach-O 367件の署名を検査して`/Applications/oMLX.app`へ
+  配置した。Passport client secretは`~/.omlx/passport-client.secret`へmode `0600`で配置した。
+- main API keyを機械credentialとして生成・保存し、値を表示せず、`/api/status`が無認証401、
+  Bearerと`x-api-key`の双方で200になることを確認した。
+- 導入済みアプリが開く`http://127.0.0.1:8000/admin`で、旧API key loginではなく
+  「Bunrin Passportでログイン」だけを表示することを確認した。秘密配置前から稼働していた
+  backendは進行中推論の完了と資源解放を待って正常終了させ、導入済みアプリの`Start Server`から
+  再起動した。再起動後は未構成警告が消え、`client=omlx`、登録loopback origin、
+  `/admin/dashboard` callbackを持つPassport画面まで実操作で到達した。
+- 新規ブラウザに本人のPassport sessionが無いため、本人確認後のcallbackとlogoutの実入力確認は
+  行っていない。
