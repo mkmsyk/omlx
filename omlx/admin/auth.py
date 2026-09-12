@@ -64,6 +64,19 @@ def cookie_secure() -> bool:
     return bool(_passport_client and _passport_client.client_origin.startswith("https://"))
 
 
+def renew_verified_session_cookie(request: Request, response) -> None:
+    """Passportが検証したrolling expiryを、同じhost-only Cookieへ再中継する。"""
+    session = getattr(request.state, "passport_session", None)
+    if session is None:
+        return
+    name = service_session_cookie_name(secure=cookie_secure())
+    if any(cookie.startswith(name + "=") for cookie in response.headers.getlist("set-cookie")):
+        return
+    set_service_session_cookie(
+        response, session.token, secure=cookie_secure(), expires_at=session.expires_at,
+    )
+
+
 def safe_admin_path(value: str | None) -> str:
     if (not value or not value.startswith("/admin") or value.startswith("//")
             or "\\" in value or "\r" in value or "\n" in value):

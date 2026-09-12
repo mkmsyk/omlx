@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 from floated_claim.passport_exchange import PassportClientError, PassportSession
+from starlette.responses import Response
 
 import omlx.server  # noqa: F401 — ensure server module is imported first
 import omlx.admin.auth as admin_auth
@@ -216,6 +217,18 @@ class TestChatPageApiKeyInjection:
 
 
 class TestPassportVerification:
+    def test_verified_session_reissues_passport_cookie_with_expiry(self):
+        request = MagicMock()
+        request.state.passport_session = PassportSession(
+            "600f7f6d-dc60-4f20-bba1-0a91eb906d4b", True, "passport-token", 4_000_000_000,
+        )
+        response = Response()
+        with patch.object(admin_auth, "cookie_secure", return_value=False):
+            admin_auth.renew_verified_session_cookie(request, response)
+        cookie = response.headers["set-cookie"]
+        assert "bunrin_session=passport-token" in cookie
+        assert "Max-Age=" in cookie
+
     def test_require_admin_validates_with_passport_even_when_api_skip_is_enabled(self):
         passport = FakePassport()
         request = MagicMock()

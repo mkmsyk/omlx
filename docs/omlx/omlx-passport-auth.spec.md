@@ -9,7 +9,8 @@
 - callbackは一回限りticketをserver-only client secretで交換し、Passportが発行した
   不透明tokenをhost-only、HttpOnly、SameSite=Lax、Path=/のCookieで中継する。
 - 保護された全要求でPassportのvalidate APIを呼び、`authorized=true`だけを許可する。
-  oMLXはtokenを署名、解釈、延長、ローカル保存しない。
+  oMLXはtokenを署名、解釈、延長、ローカル保存しない。validateが返すexpiryを共通応答middlewareが
+  host-only Cookieの`Max-Age`へ再中継し、Passportのrolling TTLとブラウザ保持期限を一致させる。
 - logoutはPassportでtokenを失効してからoMLX hostのCookieを削除する。
 - client credentialは既定で`~/.omlx/passport-client.secret`から読み、groupまたはotherに
   権限があるファイルを拒否する。環境変数でpath、Passport origin、client ID、client originを

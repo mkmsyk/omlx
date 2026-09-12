@@ -644,7 +644,7 @@ except ImportError:
     pass
 
 # Include admin routes
-from .admin.auth import _RedirectToLogin, require_admin
+from .admin.auth import _RedirectToLogin, renew_verified_session_cookie, require_admin
 from .admin.routes import router as admin_router
 from .admin.routes import set_admin_getters
 
@@ -655,6 +655,14 @@ set_admin_getters(
     lambda: _server_state.global_settings,
 )
 app.include_router(admin_router)
+
+
+@app.middleware("http")
+async def renew_passport_browser_cookie(request, call_next):
+    """管理面で検証済みのPassport sessionを、応答で一度だけ更新する。"""
+    response = await call_next(request)
+    renew_verified_session_cookie(request, response)
+    return response
 
 _cluster_routes_registered = False
 
