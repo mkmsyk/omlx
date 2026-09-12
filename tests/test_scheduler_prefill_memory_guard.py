@@ -123,6 +123,22 @@ def test_preflight_rejects_when_estimated_peak_exceeds_hard_limit():
     assert rejection.limit_bytes == 1
 
 
+def test_preflight_prices_replayed_output_as_prefill_context():
+    """A process-memory retry must not re-admit more KV than it priced."""
+    scheduler = _make_scheduler()
+    scheduler._prefill_memory_guard = True
+    scheduler._memory_hard_limit_bytes = 10**18
+    req = _make_request(3)
+    req.prompt_token_ids = [1, 2, 3, 4, 5]
+    req.num_prompt_tokens = 3  # immutable client-prompt metric
+    req._pressure_replayed = True
+
+    with patch.object(scheduler, "_admission_estimate", wraps=scheduler._admission_estimate) as estimate:
+        scheduler._preflight_memory_check(req)
+
+    assert estimate.call_args.kwargs["num_prompt_tokens"] == 5
+
+
 def test_route_preflight_requests_eviction_before_safety_cap_rejection(monkeypatch):
     scheduler = _make_scheduler()
     scheduler._prefill_memory_guard = True

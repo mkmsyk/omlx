@@ -3025,3 +3025,55 @@ class TestPressureReclaimGrace:
             await enforcer._check_and_enforce()
         shrink.assert_called_once()
         engine.abort_all_requests.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_reachable_scheduler_defers_one_request_without_bulk_abort(
+        self, enforcer
+    ):
+        scheduler = SimpleNamespace(
+            request_memory_pressure_defer=MagicMock(return_value=True),
+            _last_mlx_active_memory_bytes=11 * 1024**3,
+        )
+        engine = SimpleNamespace(
+            scheduler=scheduler,
+            has_active_requests=lambda: True,
+            abort_all_requests=AsyncMock(return_value=3),
+        )
+        entry = _make_entry("big-model", engine=engine)
+        entry.in_use = 1
+        enforcer._engine_pool._entries = {"big-model": entry}
+        enforcer._engine_pool._find_lru_victim.return_value = None
+
+        with (
+            patch("omlx.process_memory_enforcer.mx") as mock_mx,
+            patch.object(enforcer, "_shrink_hot_cache_for_pressure", return_value=0),
+        ):
+            mock_mx.get_active_memory.return_value = 11 * 1024**3
+            mock_mx.get_cache_memory.return_value = 3 * 1024**3
+            await enforcer._check_and_enforce()
+
+        scheduler.request_memory_pressure_defer.assert_called_once_with()
+        engine.abort_all_requests.assert_not_awaited()
+        assert entry.pending_unload_reason is None
+
+    @pytest.mark.asyncio
+    async def test_emergency_defers_scheduler_requests_before_abort_fallback(
+        self, enforcer
+    ):
+        scheduler = SimpleNamespace(request_memory_pressure_defer=MagicMock(return_value=True))
+        managed = SimpleNamespace(
+            scheduler=scheduler,
+            abort_all_requests=AsyncMock(return_value=5),
+        )
+        unmanaged = SimpleNamespace(abort_all_requests=AsyncMock(return_value=2))
+        enforcer._engine_pool._entries = {
+            "managed": _make_entry("managed", engine=managed),
+            "unmanaged": _make_entry("unmanaged", engine=unmanaged),
+        }
+
+        recovered = await enforcer._abort_loaded_requests_for_memory_emergency()
+
+        assert recovered == 3
+        scheduler.request_memory_pressure_defer.assert_called_once_with()
+        managed.abort_all_requests.assert_not_awaited()
+        unmanaged.abort_all_requests.assert_awaited_once()

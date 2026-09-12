@@ -1094,6 +1094,24 @@ class ProcessMemoryEnforcer:
             )
         return requested
 
+    def _request_scheduler_memory_defer(self, entry: Any) -> bool:
+        """Request one safe batch-row defer from an oMLX scheduler.
+
+        The enforcer cannot select or detach a request itself: it is outside
+        the MLX executor thread. A resolved scheduler owns both decisions and
+        the mutation; a ``False`` result leaves the caller to its established
+        non-scheduler fallback.
+        """
+        scheduler = self._resolve_scheduler(entry)
+        request = getattr(scheduler, "request_memory_pressure_defer", None)
+        if not callable(request):
+            return False
+        try:
+            return request() is True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Memory-pressure defer request failed: %s", exc)
+            return False
+
     def get_pressure_level(self) -> str:
         """Return cached pressure level: 'ok', 'soft', or 'hard'.
 
@@ -1298,11 +1316,15 @@ class ProcessMemoryEnforcer:
                 adjust(self._pressure_level)
 
     async def _abort_loaded_requests_for_memory_emergency(self) -> int:
-        """Abort active requests on loaded models without unloading them."""
-        aborted_total = 0
+        """Defer one scheduler request per model; abort only non-scheduler engines."""
+        deferred_or_aborted_total = 0
         for entry in self._engine_pool._entries.values():
             engine = getattr(entry, "engine", None)
             if engine is None:
+                continue
+
+            if self._request_scheduler_memory_defer(entry):
+                deferred_or_aborted_total += 1
                 continue
 
             abort_all = getattr(engine, "abort_all_requests", None)
@@ -1322,8 +1344,8 @@ class ProcessMemoryEnforcer:
                 continue
 
             if isinstance(result, (int, float)):
-                aborted_total += max(0, int(result))
-        return aborted_total
+                deferred_or_aborted_total += max(0, int(result))
+        return deferred_or_aborted_total
 
     def _find_lru_busy_non_pinned_victim_locked(self) -> str | None:
         """Find a non-pinned loaded model that is busy but abortable.
@@ -1628,6 +1650,26 @@ class ProcessMemoryEnforcer:
                     busy_victim = self._find_lru_busy_non_pinned_victim_locked()
                     if busy_victim is not None:
                         entry = self._engine_pool._entries.get(busy_victim)
+                        deferred = (
+                            self._request_scheduler_memory_defer(entry)
+                            if entry is not None
+                            else False
+                        )
+                        if deferred:
+                            logger.warning(
+                                "Hard memory pressure: deferred one request on '%s' "
+                                "to its waiting queue",
+                                busy_victim,
+                            )
+                            # Do not mark the model pending-unload: the request
+                            # remains live and will re-prefill after the
+                            # scheduler's synchronized cache reclaim.
+                            break
+
+                        # Engines without a Scheduler cannot safely detach a
+                        # single batch row. Preserve their existing fallback;
+                        # Batched oMLX engines take the non-destructive branch
+                        # above and never bulk-abort on this path.
                         aborted = 0
                         if (
                             entry
@@ -1689,16 +1731,16 @@ class ProcessMemoryEnforcer:
                             else:
                                 emergency_current = 0
                             if emergency and emergency_current >= ceiling:
-                                aborted = await (
+                                recovered = await (
                                     self._abort_loaded_requests_for_memory_emergency()
                                 )
-                                if aborted > 0:
+                                if recovered > 0:
                                     logger.warning(
-                                        "Emergency memory pressure: aborted "
-                                        "%d in-flight request(s) "
+                                        "Emergency memory pressure: requested "
+                                        "recovery for %d in-flight request(s) "
                                         "(current=%s, ceiling=%s); models "
                                         "kept loaded.",
-                                        aborted,
+                                        recovered,
                                         _format_gb(emergency_current),
                                         _format_gb(ceiling),
                                     )

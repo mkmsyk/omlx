@@ -34,6 +34,7 @@ from omlx.scheduler import (
     SchedulerOutput,
     SchedulingPolicy,
     _BoundarySnapshotProvider,
+    _remaining_generation_tokens,
     _PrefillState,
     _PreflightRejection,
     _StoreCacheGate,
@@ -6805,3 +6806,66 @@ class TestHybridDecodeKvEvalDefault:
             model=mock_model, tokenizer=mock_tokenizer, config=SchedulerConfig()
         )
         assert scheduler._decode_eval_kv_cache_interval == 0
+
+
+class TestProcessMemoryPressureDefer:
+    def _running_request(self, request_id, output_tokens):
+        return Request(
+            request_id=request_id,
+            prompt="prompt",
+            sampling_params=SamplingParams(max_tokens=8),
+            prompt_token_ids=[1, 2, 3],
+            num_prompt_tokens=3,
+            output_token_ids=list(output_tokens),
+            status=RequestStatus.RUNNING,
+        )
+
+    def test_defers_only_newest_request_to_waiting_tail(self, mock_model, mock_tokenizer):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        older = self._running_request("older", [11])
+        victim = self._running_request("victim", [21, 22])
+        scheduler.running = {older.request_id: older, victim.request_id: victim}
+        scheduler.requests = dict(scheduler.running)
+        scheduler.batch_generator = MagicMock()
+        scheduler.request_id_to_uid[victim.request_id] = 9
+        scheduler.uid_to_request_id[9] = victim.request_id
+
+        with (
+            patch("omlx.scheduler._safe_sync_stream"),
+            patch("omlx.scheduler._unregister_uid_row"),
+        ):
+            assert scheduler.request_memory_pressure_defer() is True
+            assert scheduler._consume_memory_pressure_defer() is True
+            assert scheduler._defer_one_running_request_for_memory_pressure() is None
+
+        assert list(scheduler.running) == [older.request_id]
+        assert list(scheduler.waiting) == [victim]
+        assert victim.status is RequestStatus.WAITING
+        assert victim.memory_pressure_retries == 1
+        assert victim.prompt_token_ids == [1, 2, 3, 21, 22]
+        assert victim.output_token_ids == [21, 22]
+        assert scheduler.request_id_to_uid.get(victim.request_id) is None
+        scheduler.batch_generator.remove.assert_called_once_with([9])
+
+    def test_pressure_retry_budget_ends_only_the_selected_request(
+        self, mock_model, mock_tokenizer
+    ):
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+        older = self._running_request("older", [])
+        victim = self._running_request("victim", [])
+        victim.memory_pressure_retries = scheduler._MAX_MEMORY_PRESSURE_RETRIES
+        scheduler.running = {older.request_id: older, victim.request_id: victim}
+        scheduler.requests = dict(scheduler.running)
+
+        with patch.object(scheduler, "_do_abort_request", return_value=True) as abort:
+            output = scheduler._defer_one_running_request_for_memory_pressure()
+
+        assert output is not None
+        assert output.request_id == victim.request_id
+        assert output.error_code == "process_memory_retry_exhausted"
+        abort.assert_called_once_with(victim.request_id)
+        assert scheduler.running[older.request_id] is older
+
+    def test_replayed_request_keeps_remaining_generation_budget(self):
+        request = self._running_request("victim", [1, 2, 3])
+        assert _remaining_generation_tokens(request) == 5

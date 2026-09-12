@@ -226,6 +226,8 @@ class Request:
     prefill_eviction_retries: int = (
         0  # Per-request prefill-headroom eviction phase counter
     )
+    # Process-wide pressure retry after this request has joined a decode batch.
+    memory_pressure_retries: int = 0
 
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None

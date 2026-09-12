@@ -1321,6 +1321,12 @@ def _batch_generator_all_tokens(request: Any) -> list[int]:
     return list(token_ids[:-1])
 
 
+def _remaining_generation_tokens(request: Any) -> int:
+    """Keep an API request's original generation budget after a replay."""
+    emitted = len(getattr(request, "output_token_ids", []))
+    return max(1, request.sampling_params.max_tokens - emitted)
+
+
 def _cache_layer_token_count(cache_obj: Any) -> int:
     """Return the number of tokens stored in a single cache layer."""
     sub_caches = getattr(cache_obj, "caches", None)
@@ -1884,6 +1890,9 @@ class Scheduler:
         # mid-decode. GIL-atomic flag; the enforcer never touches Metal
         # directly.
         self._pending_pressure_clear: bool = False
+        # Set only by the enforcer thread; BatchGenerator mutation remains
+        # exclusively owned by step() on the inference executor.
+        self._pending_pressure_defer: bool = False
 
         # Lock-free admin snapshot. Published at the end of each step() while
         # the engine thread is the sole writer of running/waiting; the admin
@@ -5566,7 +5575,7 @@ class Scheduler:
         with mx.stream(self._stream):
             uids = self.batch_generator.insert(
                 [state.last_token],
-                max_tokens=[request.sampling_params.max_tokens],
+                max_tokens=[_remaining_generation_tokens(request)],
                 caches=[state.cache] if state.cache else None,
                 all_tokens=[_batch_generator_all_tokens(request)],
                 samplers=[state.sampler],
@@ -5589,7 +5598,8 @@ class Scheduler:
             if hasattr(self.model, "register_rope_delta"):
                 self.model.register_rope_delta(uid, request.rope_deltas)
 
-            self.total_prompt_tokens += request.num_prompt_tokens
+            if not getattr(request, "_pressure_replayed", False):
+                self.total_prompt_tokens += request.num_prompt_tokens
             cache_info = (
                 f", {request.cached_tokens} cached" if request.cached_tokens > 0 else ""
             )
@@ -8819,7 +8829,7 @@ class Scheduler:
                     else {}
                 ),
                 first_bonus=int(first_bonus_arr.item()),
-                max_tokens=request.sampling_params.max_tokens,
+                max_tokens=_remaining_generation_tokens(request),
                 sampler=mtp_sampler,
                 draft_block_size=self._vlm_mtp_draft_block_size,
                 token_dtype=mx.int32,
@@ -8845,7 +8855,7 @@ class Scheduler:
             prompt_cache=prefilled_cache,
             sampler=mtp_sampler,
             state_machine=state_machine,
-            max_tokens=request.sampling_params.max_tokens,
+            max_tokens=_remaining_generation_tokens(request),
             stop_token_ids=set(eos_ids),
         )
         logger.info(
@@ -9297,6 +9307,117 @@ class Scheduler:
         """
         self._pending_pressure_clear = True
 
+    def request_memory_pressure_defer(self) -> bool:
+        """Ask the scheduler to return one decoding request to its queue.
+
+        The process-memory enforcer runs outside the inference executor, so
+        this only sets a GIL-atomic flag. ``step()`` owns the live
+        BatchGenerator and detaches the row at its next safe boundary.
+        """
+        if not (self.running or self.prefilling or self.waiting):
+            return False
+        self._pending_pressure_defer = True
+        return True
+
+    def _consume_memory_pressure_defer(self) -> bool:
+        if not self._pending_pressure_defer:
+            return False
+        self._pending_pressure_defer = False
+        return True
+
+    _MAX_MEMORY_PRESSURE_RETRIES = 2
+
+    def _defer_one_running_request_for_memory_pressure(
+        self,
+    ) -> RequestOutput | None:
+        """Move the newest decoding row to the waiting tail without aborting it.
+
+        A process-wide sample cannot attribute pressure to one request. The
+        newest admitted row is a deterministic victim that preserves older
+        work. Its emitted token history becomes replay context, so the client
+        receives no duplicate text after its cold re-prefill.
+        """
+        if not self.running and not self.prefilling:
+            return None
+        request = (
+            next(reversed(self.running.values()))
+            if self.running
+            else next(reversed(self.prefilling))
+        )
+        request_id = request.request_id
+        if request.memory_pressure_retries >= self._MAX_MEMORY_PRESSURE_RETRIES:
+            message = (
+                "Request could not resume after repeated process memory "
+                "pressure; retry budget exhausted."
+            )
+            logger.warning(
+                "Memory-pressure retry budget exhausted for %s (%d retries)",
+                request_id,
+                self._MAX_MEMORY_PRESSURE_RETRIES,
+            )
+            self._do_abort_request(request_id)
+            return RequestOutput(
+                request_id=request_id,
+                finished=True,
+                finish_reason="error",
+                error=message,
+                error_code="process_memory_retry_exhausted",
+            )
+
+        # Match the regular deferred-abort ordering before shrinking a live
+        # batch row. This runs only on the engine executor thread.
+        _safe_sync_stream(self._stream)
+        uid = self.request_id_to_uid.pop(request_id, None)
+        if uid is not None:
+            self._remove_uid_from_active_batch(uid)
+            if hasattr(self.model, "unregister_rope_delta"):
+                self.model.unregister_rope_delta(uid)
+            if uid < 0:
+                mtp_state = self._vlm_mtp_active.pop(uid, None)
+                close = getattr(mtp_state.generator, "close", None) if mtp_state else None
+                if callable(close):
+                    close()
+            _unregister_uid_row(self.model, uid)
+            self.uid_to_request_id.pop(uid, None)
+
+        self.running.pop(request_id, None)
+        self._drop_from_prefill_queues(request_id)
+        self._cleanup_specprefill(request_id)
+        self._drop_boundary_snapshots_for_request(request_id)
+        self._release_paged_cache_for_request(request_id)
+        get_prefill_tracker().remove(request_id)
+
+        # Keep stream/parser state and replay the visible output as context.
+        # Sparse prefill is prompt-only, so it cannot safely represent this
+        # extended history.
+        original_prompt = getattr(
+            request, "_pressure_original_prompt_token_ids", request.prompt_token_ids
+        )
+        request._pressure_original_prompt_token_ids = list(original_prompt or [])
+        request.prompt_token_ids = list(request._pressure_original_prompt_token_ids) + list(
+            request.output_token_ids
+        )
+        request.specprefill_indices = None
+        request.prompt_cache = None
+        request.cached_tokens = 0
+        request.remaining_tokens = request.prompt_token_ids
+        request.block_table = None
+        request.shared_prefix_blocks = 0
+        request._extracted_cache = None
+        request._model_cache_config = None
+        request.batch_uid = None
+        request.status = RequestStatus.WAITING
+        request.memory_pressure_retries += 1
+        request._pressure_replayed = True
+        self.waiting.append(request)
+        logger.warning(
+            "Deferred %s to waiting tail for process-memory retry %d/%d",
+            request_id,
+            request.memory_pressure_retries,
+            self._MAX_MEMORY_PRESSURE_RETRIES,
+        )
+        return None
+
     def _consume_pressure_clear(self) -> bool:
         """Retire a pending hard-pressure clear (inference-thread side).
 
@@ -9507,6 +9628,7 @@ class Scheduler:
             or self._deferred_clear_at is not None
             or self._pending_reclaim_request
             or self._pending_pressure_clear
+            or self._pending_pressure_defer
         )
 
     def has_pending_route_preflight_cleanup(self) -> bool:
@@ -9722,7 +9844,14 @@ class Scheduler:
         if self.memory_monitor is None:
             return None
 
+        # A request returned from a process-memory defer re-prefills its
+        # original prompt plus emitted tokens, preserving the stream without
+        # duplicating client-visible output.  ``num_prompt_tokens`` remains
+        # the immutable client-prompt count for metrics and generation
+        # limits, so it must not understate this replay allocation.
         prompt_tokens = request.num_prompt_tokens
+        if getattr(request, "_pressure_replayed", False) is True:
+            prompt_tokens = len(request.prompt_token_ids or [])
         cached_tokens = request.cached_tokens or 0
 
         current = self._current_usage_bytes()
@@ -10862,7 +10991,7 @@ class Scheduler:
             with mx.stream(self._stream):
                 uids = self.batch_generator.insert(
                     [tokens_to_process],
-                    max_tokens=[request.sampling_params.max_tokens],
+                    max_tokens=[_remaining_generation_tokens(request)],
                     caches=[cache_to_use] if cache_to_use else None,
                     all_tokens=[_batch_generator_all_tokens(request)],
                     samplers=[sampler],
@@ -10886,7 +11015,8 @@ class Scheduler:
                 if hasattr(self.model, "register_rope_delta"):
                     self.model.register_rope_delta(uid, request.rope_deltas)
 
-                self.total_prompt_tokens += request.num_prompt_tokens
+                if not getattr(request, "_pressure_replayed", False):
+                    self.total_prompt_tokens += request.num_prompt_tokens
                 cache_info = (
                     f", {request.cached_tokens} cached"
                     if request.cached_tokens > 0
@@ -12095,6 +12225,20 @@ class Scheduler:
         # Process pending aborts FIRST (thread-safe with hybrid executor)
         self._process_pending_aborts()
 
+        # Process-wide hard pressure used to abort every collector in this
+        # model's batch. Defer exactly one row at the scheduler boundary
+        # instead. Do not re-admit it in this same step: the queue transition
+        # must be real, and the synchronized cache reclaim below needs a turn
+        # to lower the baseline.
+        pressure_deferred = False
+        if self._consume_memory_pressure_defer():
+            pressure_error = self._defer_one_running_request_for_memory_pressure()
+            pressure_deferred = True
+            output.has_work = True
+            if pressure_error is not None:
+                output.outputs.append(pressure_error)
+                output.finished_request_ids.add(pressure_error.request_id)
+
         # Drain a deferred between-turn reclaim requested by the memory
         # enforcer (only acts when the scheduler is idle).
         self._process_pending_reclaim()
@@ -12125,7 +12269,10 @@ class Scheduler:
                     )
 
             # Schedule waiting requests
-            scheduled, rejected = self._schedule_waiting()
+            if pressure_deferred:
+                scheduled, rejected = [], []
+            else:
+                scheduled, rejected = self._schedule_waiting()
             # Merge chunked-prefill completions into the scheduled list.
             if chunked_scheduled:
                 scheduled = chunked_scheduled + scheduled

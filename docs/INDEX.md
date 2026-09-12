@@ -16,8 +16,12 @@
 
 [メモリ圧力後のpending unload回復](internal/session-pending-unload-recovery-20260912.md)。
 
+[プロセスメモリ圧力時の個別request退避](internal/session-process-memory-request-defer-20260912.md)。
+
 ## アーカイブ
 
 導入手順と当日の実機検証を確認する場合は、[完了計画](archive/omlx-managed-prefill.plan.md)と[検証記録](archive/omlx-managed-prefill.walkthrough.md)を参照する。
 
 緊急メモリ回収後に新規リクエストが409で停滞した場合は、[完了計画](archive/omlx-pending-unload-recovery.plan.md)と[検証記録](archive/omlx-pending-unload-recovery.walkthrough.md)を参照する。
+
+hard/emergency pressureで同一モデルのstreamが一斉abortした事象を再調査する場合は、[完了計画](archive/omlx-process-memory-request-defer.plan.md)と[検証記録](archive/omlx-process-memory-request-defer.walkthrough.md)を参照する。
