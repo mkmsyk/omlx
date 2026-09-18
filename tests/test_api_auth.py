@@ -285,9 +285,10 @@ class TestSkipApiKeyVerification:
             _server_state.api_key = original_key
             _server_state.global_settings = original_gs
 
-    def test_skip_verification_on_any_host(self):
-        """Skip verification when enabled regardless of host."""
+    def test_skip_verification_is_ignored_on_network_host(self):
+        """The no-auth switch must not bypass API auth on a network bind."""
         from omlx.server import verify_api_key, _server_state
+        from fastapi import HTTPException
         import asyncio
 
         original_key = _server_state.api_key
@@ -298,8 +299,11 @@ class TestSkipApiKeyVerification:
         )
 
         try:
-            result = asyncio.run(verify_api_key(request=_mock_request(), credentials=None))
-            assert result is True
+            with pytest.raises(HTTPException) as exc_info:
+                asyncio.run(
+                    verify_api_key(request=_mock_request(), credentials=None)
+                )
+            assert exc_info.value.status_code == 401
         finally:
             _server_state.api_key = original_key
             _server_state.global_settings = original_gs
