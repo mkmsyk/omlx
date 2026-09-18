@@ -27,18 +27,26 @@
   - 39 passed
 - `uv lock --check`
 - `uv run python -m compileall -q omlx tests`
-- `git diff --cached --check`: pass
+- `git diff --check`: pass
+- `OMLX_DEEPSEEK_MOE_NAX=0 uv run pytest -q tests/test_deepseek_v41_affine.py tests/test_deepseek_v4_dspark.py tests/test_glm_moe_dsa_patch.py`
+  - 115 passed
 
 標準全体テスト:
 
-- `uv run pytest -m "not slow"`
-- 14,091 passed、197 skipped、79 deselected、14 failed
-- 失敗内訳は、native custom kernel由来13件と、実行環境の `HF_HUB_DISABLE_XET=1` に依存した1件。
-- `env -u HF_HUB_DISABLE_XET` ではXetテスト単体がpassした。
-- `OMLX_DEEPSEEK_MOE_NAX=0` でNAXのstock routingを外しても、旧metallibが未収録のaffine bit/variantとDSpark ringの不一致が残った。
+- `env -u HF_HUB_DISABLE_XET OMLX_DEEPSEEK_MOE_NAX=0 uv run pytest -m "not slow"`
+  - 14,242 passed、60 skipped、79 deselected
 
-## 未完了・ブロッカー
+## native kernel再ビルドと互換修正
 
-MLXのpin更新に伴い、同梱custom kernel binaryの再ビルドが必要。`nanobind==2.15.0`導入後に `OMLX_WITH_CUSTOM_KERNEL=1 uv pip install -e . --no-build-isolation` を実行したが、Xcode 27のMetal Toolchain未導入で `xcrun ... metal` が失敗した。`xcodebuild -downloadComponent MetalToolchain`もApple asset取得が進まず中断した。
+- `xcodebuild -runFirstLaunch`でXcodeの初回システムコンポーネント導入を完了した。
+- Xcode 27.0のMetal ToolchainはGUIから取得を開始したが、`xcodebuild -showComponent MetalToolchain -json`では作業時点で`uninstalled`のままだった。
+- macOSに既に存在するApple公式Metal Toolchain（`/var/run/com.apple.security.cryptexd/mnt`配下）を一時的な`xcrun`ラッパー経由で選択し、次のコマンドでMLX 0.32.2向けcustom kernelを再ビルドした。
+  - `OMLX_WITH_CUSTOM_KERNEL=1 PATH=/tmp:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin uv pip install -e . --no-build-isolation`
+- 再ビルド後、全5系統（bonsai、decode_fast、glm_moe_dsa、minimax_m3、qwen35_prefill）のnative artifactがimport可能であることを確認した。
+- MLX 0.32.2でDSparkの物理ring kernelとstock verify GEMMのreduction順が一致しないため、`OMLX_DSPARK_RING_NATIVE=1`の明示時だけ物理ringを使い、既定値はmaterialized rowwise経路にした。現行Apple GPUではstock rowwiseと同じ計算順になる。
+- MLX 0.32.2で差分が出るFP16 affine block kernelはstock `mx.gather_qmm`へフォールバックし、BF16はnative block kernelを継続利用するようにした。
 
-このため、Python側の同期と主要回帰は検証済みだが、MLX 0.32.2向けnative `.so/.metallib`の再生成と、それを使った全体テスト成功は未確認である。Metal Toolchainを導入できる環境でcustom kernelを再ビルドし、上記14件を再実行する必要がある。
+## 残る環境差
+
+- Xcode 27.0のMetal Toolchainコンポーネント自体は作業時点で`uninstalled`であり、GUIのダウンロード完了までは確認できていない。ただし、既存のApple公式toolchainで再ビルドし、native対象テストおよび標準全体テストは成功している。
+- `OMLX_DSPARK_RING_NATIVE=1`はMLX 0.32.2でのreduction順差を意図的に再現する明示的なベンチマーク用経路であり、通常運用の既定値では使用しない。

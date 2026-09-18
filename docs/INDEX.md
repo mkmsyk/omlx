@@ -15,7 +15,7 @@
 | [管理画面アクティブモデル一覧の未コミット変更](internal/session-active-model-visibility-20260906.md) | 非表示モデルの一覧除外修正と検証結果 |
 | [oMLX人間sessionのPassport一元化](internal/session-passport-auth-20260912.md) | 管理画面とネイティブアプリの認証経路変更 |
 | [Passport Cookie更新の統一](internal/session-passport-cookie-renewal-20260913.md) | Passportのrolling expiryを管理面Cookieへ共通middlewareで再中継 |
-| [oMLX upstream土台更新](internal/session-upstream-foundation-20260918.md) | upstream統合、依存更新、主要回帰、native kernel再ビルドのブロッカー |
+| [oMLX upstream土台更新](internal/session-upstream-foundation-20260918.md) | upstream統合、依存更新、native kernel再ビルド、全体テスト |
 
 [管制管理下のprefill退避](internal/session-managed-prefill-20260910.md)。
 
@@ -25,7 +25,7 @@
 
 ## アーカイブ
 
-oMLX upstream土台更新の計画・検証・タスクは、[計画](omlx/omlx-upstream-foundation.plan.md)、[検証記録](omlx/omlx-upstream-foundation.walkthrough.md)、[タスク](omlx/omlx-upstream-foundation.tasks.md)を参照する。native kernel再ビルドの未完了理由も検証記録に記載する。
+oMLX upstream土台更新の計画・検証・タスクは、[計画](omlx/omlx-upstream-foundation.plan.md)、[検証記録](omlx/omlx-upstream-foundation.walkthrough.md)、[タスク](omlx/omlx-upstream-foundation.tasks.md)を参照する。native kernelのtoolchain環境差と互換修正も検証記録に記載する。
 
 Passport認証移行の実装・配備を確認する場合は、[移行計画](omlx/archive/omlx-passport-auth.plan.md)と[検証記録](omlx/archive/omlx-passport-auth.walkthrough.md)を参照する。
 

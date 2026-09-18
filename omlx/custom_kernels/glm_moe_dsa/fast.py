@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +97,13 @@ def _probe_mma_score(ext) -> bool:
 
 
 _EXT_MMA_SCORE = _probe_mma_score(_ext)
+
+# MLX 0.32 changed the reduction schedule used by the stock verify GEMM.
+# Keep the physical-ring kernel available for explicit benchmarking, but use
+# the materialized rowwise path by default until the two reduction orders are
+# bitwise identical again.
+_DSPARK_NATIVE = os.environ.get("OMLX_DSPARK_RING_NATIVE", "").strip().lower()
+_DSPARK_NATIVE_ENABLED = _DSPARK_NATIVE in ("1", "true", "yes", "on")
 
 
 NATIVE_SYMBOLS = (
@@ -519,12 +527,36 @@ def dspark_ring_gemm(
 ) -> mx.array:
     if _ext is None or not hasattr(_ext, "dspark_ring_gemm"):
         raise RuntimeError("DSpark physical-ring GEMM is unavailable")
-    return _ext.dspark_ring_gemm(
-        lhs,
-        source,
-        indices,
-        transpose_rhs,
-        **_native_stream_kwargs(stream),
+    if _DSPARK_NATIVE_ENABLED:
+        return _ext.dspark_ring_gemm(
+            lhs,
+            source,
+            indices,
+            transpose_rhs,
+            **_native_stream_kwargs(stream),
+        )
+
+    gathered = mx.contiguous(mx.take(source, indices, axis=0))
+    architecture = str(mx.device_info().get("architecture", ""))
+    if architecture.endswith(("d", "g", "p")) and hasattr(
+        _ext, "dspark_rowwise_gemm"
+    ):
+        return _ext.dspark_rowwise_gemm(
+            mx.contiguous(lhs),
+            gathered,
+            transpose_rhs,
+            **_native_stream_kwargs(stream),
+        )
+    return mx.concatenate(
+        [
+            lhs[idx : idx + 1]
+            @ (
+                gathered[idx : idx + 1].swapaxes(-1, -2)
+                if transpose_rhs
+                else gathered[idx : idx + 1]
+            )
+            for idx in range(lhs.shape[0])
+        ]
     )
 
 
@@ -758,6 +790,22 @@ def deepseek_mxfp4_gather_qmm_expert(
     raise RuntimeError("deepseek_mxfp4_gather_qmm_expert native kernel is unavailable")
 
 
+def _affine_block_indices(block_meta: mx.array, block_count: mx.array) -> mx.array:
+    """Recover sorted expert ids for the exact stock affine fallback."""
+    count = int(block_count.item())
+    rows = block_meta[:count].tolist()
+    route_indices = [0] * max(
+        (start + row_count for start, _, row_count in rows),
+        default=0,
+    )
+    for start, expert, row_count in rows:
+        route_indices[start : start + row_count] = [expert] * row_count
+    return mx.array(
+        route_indices,
+        dtype=mx.uint32,
+    )
+
+
 def deepseek_affine_gather_qmm_blocks(
     x: mx.array,
     weight: mx.array,
@@ -771,6 +819,23 @@ def deepseek_affine_gather_qmm_blocks(
     *,
     stream=None,
 ) -> mx.array:
+    # MLX 0.32.2's stock fp16 gather_qmm and the custom block kernel use
+    # different reduction orders. Preserve exact stock results for fp16;
+    # bfloat16 continues to use the native block path.
+    if x.dtype == mx.float16:
+        indices = _affine_block_indices(block_meta, block_count)
+        return mx.gather_qmm(
+            x,
+            weight,
+            scales,
+            biases,
+            rhs_indices=indices,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+            mode="affine",
+            sorted_indices=True,
+        )
     if _ext is not None and hasattr(_ext, "deepseek_affine_gather_qmm_blocks"):
         return _ext.deepseek_affine_gather_qmm_blocks(
             x,
@@ -803,6 +868,33 @@ def deepseek_affine_gather_qmm_pair_concat_blocks(
     *,
     stream=None,
 ) -> mx.array:
+    if x.dtype == mx.float16:
+        indices = _affine_block_indices(block_meta, block_count)
+        y0 = mx.gather_qmm(
+            x,
+            weight0,
+            scales0,
+            biases0,
+            rhs_indices=indices,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+            mode="affine",
+            sorted_indices=True,
+        )
+        y1 = mx.gather_qmm(
+            x,
+            weight1,
+            scales1,
+            biases1,
+            rhs_indices=indices,
+            transpose=True,
+            group_size=group_size,
+            bits=bits,
+            mode="affine",
+            sorted_indices=True,
+        )
+        return mx.concatenate([y0, y1], axis=-1)
     if _ext is not None and hasattr(
         _ext, "deepseek_affine_gather_qmm_pair_concat_blocks"
     ):
