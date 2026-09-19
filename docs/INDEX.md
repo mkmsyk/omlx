@@ -2,6 +2,9 @@
 
 ## 現行文書
 
+| [omlx-structured-translation.spec.md](omlx/omlx-structured-translation.spec.md) | TranslateGemmaのstructured content block保持契約 |
+| [omlx-structured-translation.walkthrough.md](omlx/omlx-structured-translation.walkthrough.md) | patch、staged app、全体テストの検証結果 |
+
 | 文書 | 内容 |
 |---|---|
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 開発参加、テスト、コード構成の案内 |
@@ -9,6 +12,8 @@
 | [Passport認証仕様](omlx/omlx-passport-auth.spec.md) | browser sessionと機械credentialの境界 |
 
 ## 内部作業ログ
+
+| [session-structured-translation-20260919.md](internal/session-structured-translation-20260919.md) | TranslateGemma structured content保持の実装判断と検証 |
 
 | 文書 | 内容 |
 |---|---|

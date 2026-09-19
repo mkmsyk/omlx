@@ -454,6 +454,14 @@ def maybe_apply_pre_load_patches(
     Safe to call repeatedly; the patches are idempotent.
     """
     from ..model_settings import validate_moe_expert_offload
+    from ..patches.structured_message_content import (
+        install_structured_message_content_patch,
+    )
+
+    # mlx-lm normally flattens every list content into a string. TranslateGemma
+    # uses a typed text block for source/target language metadata, so preserve
+    # that narrow contract before the first model load.
+    install_structured_message_content_patch()
 
     if model_settings is not None:
         validate_moe_expert_offload(
