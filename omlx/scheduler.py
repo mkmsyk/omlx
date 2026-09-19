@@ -3032,6 +3032,25 @@ class Scheduler:
             except Exception:
                 pass
 
+        # The 4B TranslateGemma conversion omits eos_token_id from its
+        # generation_config.json, although its chat template terminates turns
+        # with the tokenizer's <end_of_turn> token. Without this fallback the
+        # model can repeat that marker until max_tokens and trigger an invalid
+        # non-structured continuation on the next Sidekicks turn.
+        model_ref = str(
+            getattr(self.tokenizer, "name_or_path", None)
+            or getattr(self.config, "model_name", "")
+        ).lower()
+        if "translategemma" in model_ref:
+            try:
+                encoded = self.tokenizer.encode(
+                    "<end_of_turn>", add_special_tokens=False
+                )
+                if encoded:
+                    stop_tokens.update(encoded)
+            except Exception:
+                pass
+
         # Read additional EOS tokens from generation_config.json.
         # Some models (e.g. GLM-4.6V) define multiple EOS tokens there
         # that are not reflected in tokenizer.eos_token_id.

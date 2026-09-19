@@ -15,6 +15,7 @@
 - 構造化 block の認識・Pydantic model から dict への正規化を既存の oMLX patch helper に集約する。
 - `extract_text_content` を正本の変換点として、認識した block のみ保持する。
 - Gemma 4 の名前部分一致による TranslateGemma 誤検出を止める。
+- 4B変換版で欠けている `<end_of_turn>` 停止tokenをモデル限定で補う。
 - 失敗した評価 ticket は公式 test-mode stop 経路で停止し、修正後に同じ3ケースを6実行する。
 
 ### 検証

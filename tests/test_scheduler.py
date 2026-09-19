@@ -2440,6 +2440,16 @@ class TestSchedulerStopTokens:
         stop_tokens = scheduler._get_stop_tokens()
         assert mock_tokenizer.eos_token_id in stop_tokens
 
+    def test_translategemma_falls_back_to_end_of_turn_token(
+        self, mock_model, mock_tokenizer
+    ):
+        """TranslateGemma's 4B conversion supplies no EOS config entry."""
+        mock_tokenizer.name_or_path = "mlx-community/translategemma-4b-it-8bit"
+        expected = mock_tokenizer.encode("<end_of_turn>", add_special_tokens=False)[0]
+        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+
+        assert expected in scheduler._get_stop_tokens()
+
 
 class TestSchedulerSuppressTokens:
     """Tests for generation_config.suppress_tokens handling."""
