@@ -10,6 +10,7 @@ from typing import Any, List
 
 from ..exceptions import InvalidRequestError
 from .openai_models import Message
+from ..patches.structured_message_content import translation_block_list_as_dicts
 
 # Model families whose chat templates consume message.reasoning_content directly.
 _NATIVE_REASONING_MODEL_TYPES = {
@@ -1116,11 +1117,20 @@ def extract_text_content(
             # Simple text message
             processed_messages.append({"role": role, "content": content, **_extra})
         elif isinstance(content, list):
-            # Content array - extract text parts only
-            combined_text = _extract_text_from_content_list(content)
-            processed_messages.append(
-                {"role": role, "content": combined_text, **_extra}
-            )
+            translation_blocks = translation_block_list_as_dicts(content)
+            if translation_blocks is not None:
+                # TranslateGemma's template consumes this structured mapping;
+                # flattening it would discard the language direction fields.
+                processed_messages.append(
+                    {"role": role, "content": translation_blocks, **_extra}
+                )
+            else:
+                # Ordinary content arrays retain the historical text-only
+                # conversion used by non-translation text models.
+                combined_text = _extract_text_from_content_list(content)
+                processed_messages.append(
+                    {"role": role, "content": combined_text, **_extra}
+                )
         else:
             # Unknown format, try to convert
             processed_messages.append({"role": role, "content": str(content), **_extra})

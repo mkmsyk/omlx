@@ -8,10 +8,12 @@ TranslateGemmaの翻訳言語コード付きuser contentを、oMLXのchat処理�
 
 `source_lang_code`、`target_lang_code`、`text` を備えるTranslateGemma block listだけをそのまま保持し、通常のfragment listは従来処理へ委譲する。
 
+今回の実走で、patch以前にOpenAI互換の`ContentPart`検証が翻訳固有フィールドを落としていることが判明した。そのため`ContentPart`へ明示的な任意フィールドを追加し、既存patch helperでPydantic modelをTranslateGemmaの5キー形式へ正規化してから`extract_text_content`で保持する。
+
 ## 検証結果
 
-専用単体テストとstaged appの埋込みPython smoke testは成功した。正式buildも成功した。非slow全体テストは14,235 passed、8 failedで、失敗はnative affineおよびHF XET環境の既存・環境依存テストだった。
+専用単体テストと関連テストは328 passed。非slow全体テストは14,215 passed、84 skipped、79 deselected、8 failedで、失敗はDeepSeek/GLM native affineおよびHF XET環境の既存・環境依存テストだった。最初の実走は400（入力メタデータ消失）で失敗し、公式test-mode stopで再試行を停止した。
 
 ## 残作業
 
-正式反映後、Sidekicks経由の実TranslateGemma 4B/12B ticketで、oMLX runtime上の実応答とartifact receiptを確認する。
+修正を正式反映してoMLX runtimeを再読込し、Sidekicks経由の実TranslateGemma 4B/12B ticketで、oMLX runtime上の実応答とartifact receiptを確認する。

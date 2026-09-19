@@ -71,6 +71,11 @@ class ContentPart(BaseModel):
     image_url: Optional[ImageURL] = None
     input_audio: Optional[InputAudio] = None
     file: Optional[FileContent] = None
+    # TranslateGemma structured translation content. These fields are
+    # optional so ordinary OpenAI content parts keep their existing shape.
+    source_lang_code: Optional[str] = None
+    target_lang_code: Optional[str] = None
+    image: Optional[str] = None
 
 
 # =============================================================================
