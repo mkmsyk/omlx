@@ -140,9 +140,15 @@ def is_gemma4_model(model_name: str, config: dict[str, Any] | None = None) -> bo
         if model_type in {"gemma4", "gemma4_unified", "diffusion_gemma"}:
             logger.debug(f"Gemma 4 model detected via config.model_type: {model_name}")
             return True
+        return False
 
     if model_name:
         name_lower = model_name.lower()
+        # TranslateGemma is based on Gemma 3 and has a different structured
+        # translation chat template. Its name contains "gemma-4b"/"gemma-4"
+        # as a substring, so it must be excluded before the legacy fallback.
+        if "translategemma" in name_lower:
+            return False
         if "gemma-4" in name_lower or "gemma4" in name_lower:
             logger.debug(f"Gemma 4 model detected via model name pattern: {model_name}")
             return True

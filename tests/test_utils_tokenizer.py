@@ -386,6 +386,13 @@ class TestIsGemma4Model:
         assert is_gemma4_model("GEMMA-4-27B", None) is True
         assert is_gemma4_model("my-gemma4-model", None) is True
 
+    def test_translategemma_is_not_gemma4(self):
+        assert is_gemma4_model("mlx-community/translategemma-4b-it-8bit", None) is False
+        assert is_gemma4_model(
+            "mlx-community/translategemma-12b-it-6bit",
+            {"model_type": "gemma3"},
+        ) is False
+
     def test_not_gemma4_model(self):
         assert is_gemma4_model("gemma-3-27b", None) is False
         assert is_gemma4_model("llama-3.1-8b", None) is False
