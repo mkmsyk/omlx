@@ -4331,6 +4331,15 @@ class VLMBatchedEngine(BaseEngine):
         # ``_process_chat_messages``), so mirroring that here keeps
         # preflight and execution on the same template input.
         text_messages, images, _ = extract_images_from_messages(messages)
+        if (
+            images
+            and self.model_type in {"gemma4", "gemma4_unified"}
+            and self._vlm_model.config.vision_config is None
+        ):
+            raise InvalidRequestError(
+                "This text-only Gemma 4 model does not support image input.",
+                field="messages",
+            )
         prompt = self._apply_chat_template(
             text_messages,
             template_tools,
