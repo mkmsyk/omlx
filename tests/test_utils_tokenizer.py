@@ -393,6 +393,9 @@ class TestIsGemma4Model:
             {"model_type": "gemma3"},
         ) is False
 
+    def test_text_config_type_is_gemma4(self):
+        assert is_gemma4_model("some-model", {"model_type": "gemma4_text"}) is True
+
     def test_not_gemma4_model(self):
         assert is_gemma4_model("gemma-3-27b", None) is False
         assert is_gemma4_model("llama-3.1-8b", None) is False

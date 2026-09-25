@@ -74,6 +74,11 @@ def test_affine_decode_grouped_matches_stock(monkeypatch, bits):
     reason="Requires the native extension",
 )
 def test_affine_prefill_native_blocks_and_pair(monkeypatch, bits):
+    from omlx.patches.deepseek_v4 import switch_layers
+
+    # This test exercises the pre-NAX block kernels even on M5, where the
+    # production route intentionally prefers MLX's NAX gather_qmm path.
+    monkeypatch.setattr(switch_layers, "_nax_prefers_stock", lambda _: False)
     mx.random.seed(714)
     expert = expert_for(bits)
     x = mx.random.normal((1024, 1, 64)).astype(mx.bfloat16)

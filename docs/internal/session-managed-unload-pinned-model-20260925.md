@@ -23,5 +23,29 @@ Krisis専用の`only_idle=true`退避は、pool lock内の安全再検証に既�
 
 - pinされたidleモデルは通常のprefill退避候補にならないことを維持した。
 - 同じpinされたidleモデルを外部管制入口からは条件付き退避できる回帰試験を追加した。
+- `/Users/mkmsyk/.venvs/omlx/bin/python -m pytest -q tests/test_engine_pool.py -k 'conditional_control_unload'`は
+  2件成功、失敗0だった。
+- 修正commit `b25226db`をforkの`main`へpushした。稼働venvの`omlx` import先が
+  `/Users/mkmsyk/Repositories/omlx/omlx`であることを確認した。
+- 保存済みのQwen設定は`is_pinned: false`へ戻し、Navigatorの正式な
+  `krisis-runtime-stop` barrier `runtime-stop-barrier-541c6b0b-00ae-4216-bba0-db1528c787f4`で
+  oMLXを世代交代した。barrierは17:46:53 JSTに完了した。
+- 新oMLX PID 63470の起動ログにはQwenの`Pinned model`、`Preloading pinned model`、
+  `Loading model`がなく、実需要のあるGemma 26Bだけをloadした。
+- Krisisの`/control/status`と導入済みKrisis.appの初期画面で、常駐はGemma 26Bのみ、
+  Qwenはカタログにだけ存在することを確認した。
 
-実機反映とKrisisからの退避確認はcommit・push後に追記する。
+## 全体検証で検出した独立不整合
+
+初回の標準fast suiteは14,222件成功、9件失敗だった。失敗を隔離再実行し、今回の
+`EnginePool`変更とは独立した次の不整合と確認した。
+
+- M5のNAX経路では意図的にstock `gather_qmm`へ倒す一方、pre-NAX block kernelの単体試験7件が
+  実機の既定分岐を上書きしていなかった。試験内だけpre-NAX分岐を明示し、実運転のNAX選択は変えていない。
+- `is_gemma4_model`がトップレベル`gemma4_text`をGemma 4として扱わず、DFlash parser試験が失敗した。
+  TranslateGemmaの`gemma3`除外を維持したまま`gemma4_text`を現行Gemma 4型へ追加した。
+- shellの`HF_HUB_DISABLE_XET=1`をdownloader importの副作用と誤認する試験を、環境変数を除いた
+  子processでimport前後を検査する形へ直した。利用者の外部設定は変更していない。
+
+失敗9件の隔離再試験は16件成功、`EnginePool`とtokenizerの関連試験は223件成功した。
+標準fast suiteの再実行は14,232件成功、84件skip、79件deselect、失敗0だった。
