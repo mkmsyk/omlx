@@ -25,12 +25,12 @@ Krisis専用の`only_idle=true`退避は、pool lock内の安全再検証に既�
 - 同じpinされたidleモデルを外部管制入口からは条件付き退避できる回帰試験を追加した。
 - `/Users/mkmsyk/.venvs/omlx/bin/python -m pytest -q tests/test_engine_pool.py -k 'conditional_control_unload'`は
   2件成功、失敗0だった。
-- 修正commit `b25226db`をforkの`main`へpushした。稼働venvの`omlx` import先が
+- 条件付き退避commit `b25226db`と検証修正commit `3064102c`をforkの`main`へpushした。稼働venvの`omlx` import先が
   `/Users/mkmsyk/Repositories/omlx/omlx`であることを確認した。
-- 保存済みのQwen設定は`is_pinned: false`へ戻し、Navigatorの正式な
-  `krisis-runtime-stop` barrier `runtime-stop-barrier-541c6b0b-00ae-4216-bba0-db1528c787f4`で
-  oMLXを世代交代した。barrierは17:46:53 JSTに完了した。
-- 新oMLX PID 63470の起動ログにはQwenの`Pinned model`、`Preloading pinned model`、
+- 保存済みのQwen設定は`is_pinned: false`へ戻し、最終commit反映ではNavigatorの
+  `krisis-runtime-stop` barrier `runtime-stop-barrier-a7f7e092-f981-47ed-b99b-5d05219fb3a6`で
+  oMLXを世代交代した。barrierは17:58:49 JSTに完了した。
+- 新oMLX PID 5808の起動ログにはQwenの`Pinned model`、`Preloading pinned model`、
   `Loading model`がなく、実需要のあるGemma 26Bだけをloadした。
 - Krisisの`/control/status`と導入済みKrisis.appの初期画面で、常駐はGemma 26Bのみ、
   Qwenはカタログにだけ存在することを確認した。
