@@ -9284,13 +9284,28 @@ class Scheduler:
             )
             return None
 
-        # BatchGenerator requests and one VLM MTP request are intentionally
-        # driven side by side in step(). Do not treat ordinary scheduler peers
-        # as a reason to disable MTP: when several requests are admitted in the
-        # same scheduling pass, that gate made every candidate observe a peer
-        # and left the drafter unused. The _vlm_mtp_active ownership check above
-        # is the serialization boundary: the first eligible request claims the
-        # drafter and later candidates fall back to BatchGenerator.
+        # Prefer ordinary batching when a peer is already ready or admitted.
+        # Starting MTP for the first request and falling its peers back creates
+        # a slower mixed decode group, while also paying this path's extra
+        # final target forward. A chunked-prefill request still appears in
+        # ``prefilling`` while it is finalized, so exclude the request itself.
+        waiting_count = len(getattr(self, "waiting", ()))
+        running_count = len(getattr(self, "running", ()))
+        prefilling_count = sum(
+            getattr(prefill, "request_id", None) != request.request_id
+            for prefill in getattr(self, "prefilling", ())
+        )
+        if waiting_count or running_count or prefilling_count:
+            logger.info(
+                "vlm_mtp routing skipped for %s: scheduler contention "
+                "(running=%d waiting=%d prefilling=%d); falling back to "
+                "BatchGenerator",
+                request.request_id,
+                running_count,
+                waiting_count,
+                prefilling_count,
+            )
+            return None
 
         lm = getattr(self.model, "_language_model", None)
         if lm is None or not hasattr(lm, "rollback_speculative_cache"):
