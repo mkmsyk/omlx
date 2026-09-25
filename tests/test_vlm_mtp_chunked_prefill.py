@@ -251,22 +251,10 @@ def test_route_passes_gate_with_empty_processors(caplog):
 
 
 @pytest.mark.parametrize("peer_state", ["waiting", "running", "prefilling"])
-def test_route_declines_before_model_forward_under_contention(caplog, peer_state):
-    """Any admitted peer should keep the decode group on BatchGenerator."""
+def test_route_does_not_decline_for_scheduler_peers(caplog, peer_state):
+    """Ordinary peers must not disable an otherwise available MTP drafter."""
 
-    class TargetModel:
-        _language_model = SimpleNamespace(
-            rollback_speculative_cache=lambda *args, **kwargs: None
-        )
-
-        def __init__(self):
-            self.calls = 0
-
-        def __call__(self, *args, **kwargs):
-            self.calls += 1
-            raise AssertionError("contended MTP must not run the final forward")
-
-    model = TargetModel()
+    model = SimpleNamespace()
     peer = SimpleNamespace(request_id="req-peer")
     sched = SimpleNamespace(
         _vlm_mtp_drafter=object(),
@@ -290,26 +278,22 @@ def test_route_declines_before_model_forward_under_contention(caplog, peer_state
         )
 
     assert uid is None
-    assert model.calls == 0
-    assert "scheduler contention" in caplog.text
+    assert "scheduler contention" not in caplog.text
+    assert "rollback_speculative_cache" in caplog.text
 
 
-def test_route_does_not_count_current_prefilling_request_as_contention(caplog):
-    """Chunked-prefill finalization must not treat the request as its own peer."""
-    request = _make_route_request()
+def test_route_declines_while_the_drafter_has_an_active_owner(caplog):
+    """The single-owner gate, not ordinary queue occupancy, serializes MTP."""
     sched = SimpleNamespace(
         _vlm_mtp_drafter=object(),
-        _vlm_mtp_active={},
-        waiting=[],
-        running={},
-        prefilling=[request],
+        _vlm_mtp_active={-1: object()},
         model=SimpleNamespace(),
     )
 
     with caplog.at_level(logging.INFO, logger="omlx.scheduler"):
         uid = Scheduler._route_to_vlm_mtp(
             sched,
-            request,
+            _make_route_request(),
             [object()],
             [42],
             lambda logits: logits,
@@ -317,5 +301,5 @@ def test_route_does_not_count_current_prefilling_request_as_contention(caplog):
         )
 
     assert uid is None
-    assert "scheduler contention" not in caplog.text
-    assert "rollback_speculative_cache" in caplog.text
+    assert "drafter is busy with 1 request" in caplog.text
+    assert "rollback_speculative_cache" not in caplog.text

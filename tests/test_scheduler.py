@@ -2539,6 +2539,13 @@ class TestSchedulerSuppressTokens:
 
         mock_model = FakeVLMAdapter()
         scheduler.model = mock_model
+        # Regression: several requests can already be queued or decoding when
+        # this request finishes prefill. The first eligible request must still
+        # claim the idle MTP drafter; only _vlm_mtp_active serializes it.
+        peer = SimpleNamespace(request_id="req-peer")
+        scheduler.waiting.append(peer)
+        scheduler.running[peer.request_id] = peer
+        scheduler.prefilling.append(SimpleNamespace(request_id="req-prefill"))
         request = Request(
             request_id="req-mtp",
             prompt=[1],
@@ -2580,6 +2587,23 @@ class TestSchedulerSuppressTokens:
         assert float(mock_model.batch_rope_deltas.item()) == 123.0
         assert captured["first_bonus"] == 2
         assert "prompt_tokens" not in captured
+
+        second = Request(
+            request_id="req-mtp-second",
+            prompt=[1],
+            sampling_params=SamplingParams(max_tokens=4),
+        )
+        second.prompt_token_ids = [1]
+        second.rope_deltas = 0.0
+        second_uid = scheduler._route_to_vlm_mtp(
+            second,
+            cache,
+            [1],
+            sampler,
+            state_machine=object(),
+        )
+        assert second_uid is None
+        assert len(mock_model.calls) == 1
 
         round_logits = mx.array([[0.0, 0.0, 1.0, 99.0, 0.0]])
         round_token = captured["sampler"](round_logits)
