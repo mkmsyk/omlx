@@ -3997,6 +3997,7 @@ class VLMBatchedEngine(BaseEngine):
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        observation_id = kwargs.pop("_observation_id", None)
 
         output = await self._engine.generate(
             prompt=prompt,
@@ -4007,6 +4008,7 @@ class VLMBatchedEngine(BaseEngine):
             vlm_cache_key_start=vlm_cache_key_start,
             vlm_cache_key_ranges=vlm_cache_key_ranges,
             tools=tools,
+            observation_id=observation_id,
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
@@ -4110,6 +4112,7 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: pass per-request overrides
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        observation_id = kwargs.pop("_observation_id", None)
 
         engine = self._engine
         request_id = await engine.add_request(
@@ -4127,6 +4130,7 @@ class VLMBatchedEngine(BaseEngine):
                 kwargs.get("benchmark_ane_sequence_length", 0) or 0
             ),
             tools=tools,
+            observation_id=observation_id,
             **specprefill_kwargs,
         )
 

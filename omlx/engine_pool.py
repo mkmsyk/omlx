@@ -3559,6 +3559,9 @@ class EnginePool:
                     "mtp_active_requests": int(
                         engine_stats.get("vlm_mtp_active_requests", 0) or 0
                     ),
+                    "mtp_active_observation_ids": list(
+                        engine_stats.get("vlm_mtp_active_observation_ids", []) or []
+                    ),
                     "prefill_eviction_eligible": self._is_idle_for_prefill_eviction(e),
                 }
             )

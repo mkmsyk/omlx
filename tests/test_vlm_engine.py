@@ -103,8 +103,10 @@ class FakeStreamingCore:
 
     def __init__(self):
         self.aborted_request_id = None
+        self.add_request_kwargs = None
 
     async def add_request(self, **kwargs):
+        self.add_request_kwargs = kwargs
         return "vlm-request-1"
 
     async def stream_outputs(self, request_id):
@@ -149,6 +151,23 @@ class TestVLMStreamingCleanup:
         await stream.aclose()
 
         assert fake_engine.aborted_request_id == "vlm-request-1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not HAS_MLX, reason="mlx is required to import VLMBatchedEngine"
+    )
+    async def test_stream_forwards_observation_id_separately(self):
+        fake_engine = FakeStreamingCore()
+        engine = _make_loaded_engine(model_type="test-vlm")
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate(
+            "hello", _observation_id="r-ticket-correlated"
+        )
+        await stream.__anext__()
+        await stream.aclose()
+
+        assert fake_engine.add_request_kwargs["observation_id"] == "r-ticket-correlated"
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(

@@ -2485,6 +2485,21 @@ def _request_abort_id(engine: BaseEngine) -> str | None:
     return f"transport-{uuid.uuid4().hex}"
 
 
+def _krisis_observation_id(http_request: FastAPIRequest) -> str | None:
+    """Read the bounded, opaque inference-ticket correlation from Krisis."""
+
+    value = http_request.headers.get("x-krisis-inference-ticket")
+    if value is None:
+        return None
+    allowed = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.:/"
+    if not value or len(value) > 128 or any(ch not in allowed for ch in value):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid X-Krisis-Inference-Ticket header",
+        )
+    return value
+
+
 async def _with_request_disconnect_abort(
     generator: AsyncIterator[str],
     http_request: FastAPIRequest,
@@ -3728,6 +3743,7 @@ async def create_completion(
             await engine.preflight_completion(prompt, request_id=upstream_request_id)
         await _raise_if_llm_lease_abort_requested(lease)
         inference_request_id = _request_abort_id(engine)
+        observation_id = _krisis_observation_id(http_request)
 
         if request.stream:
             response_id = f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -3747,6 +3763,7 @@ async def create_completion(
                                 resolved_model=resolved_model,
                                 response_id=response_id,
                                 inference_request_id=inference_request_id,
+                                observation_id=observation_id,
                             ),
                             http_request=http_request,
                             keepalive_chunk=keepalive,
@@ -3801,6 +3818,8 @@ async def create_completion(
                 gen_kwargs["thinking_budget"] = thinking_budget
             if inference_request_id is not None:
                 gen_kwargs["_request_id"] = inference_request_id
+            if observation_id is not None:
+                gen_kwargs["_observation_id"] = observation_id
             # Widen the repetition-penalty look-back window when the client
             # asks for it (mlx-lm default window is 20 tokens).
             repetition_context_size = getattr(
@@ -4282,6 +4301,9 @@ async def create_chat_completion(
         inference_request_id = _request_abort_id(engine)
         if inference_request_id is not None:
             chat_kwargs["_request_id"] = inference_request_id
+        observation_id = _krisis_observation_id(http_request)
+        if observation_id is not None:
+            chat_kwargs["_observation_id"] = observation_id
 
         if request.stream:
             # Pre-mint the completion id so the keepalive frame (emitted before the
@@ -4871,6 +4893,7 @@ async def stream_completion(
     resolved_model: str | None = None,
     response_id: str | None = None,
     inference_request_id: str | None = None,
+    observation_id: str | None = None,
 ) -> AsyncIterator[str]:
     """Stream completion response."""
     response_id = response_id or f"cmpl-{uuid.uuid4().hex[:8]}"
@@ -4914,6 +4937,8 @@ async def stream_completion(
         gen_kwargs["thinking_budget"] = thinking_budget
     if inference_request_id is not None:
         gen_kwargs["_request_id"] = inference_request_id
+    if observation_id is not None:
+        gen_kwargs["_observation_id"] = observation_id
     # Widen the repetition-penalty look-back window when the client
     # asks for it (mlx-lm default window is 20 tokens).
     repetition_context_size = getattr(
@@ -6627,6 +6652,9 @@ async def create_anthropic_message(
         inference_request_id = _request_abort_id(engine)
         if inference_request_id is not None:
             chat_kwargs["_request_id"] = inference_request_id
+        observation_id = _krisis_observation_id(http_request)
+        if observation_id is not None:
+            chat_kwargs["_observation_id"] = observation_id
 
         if request.stream:
             return StreamingResponse(
@@ -7172,6 +7200,9 @@ async def create_response(
         inference_request_id = _request_abort_id(engine)
         if inference_request_id is not None:
             chat_kwargs["_request_id"] = inference_request_id
+        observation_id = _krisis_observation_id(http_request)
+        if observation_id is not None:
+            chat_kwargs["_observation_id"] = observation_id
 
         if request.stream:
             sse_headers = {"X-Accel-Buffering": "no", "Cache-Control": "no-cache"}

@@ -1041,11 +1041,13 @@ class BatchedEngine(BaseEngine):
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        observation_id = kwargs.pop("_observation_id", None)
 
         output = await self._engine.generate(
             prompt=prompt,
             sampling_params=sampling_params,
             tools=tools,
+            observation_id=observation_id,
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
         )
@@ -1120,12 +1122,14 @@ class BatchedEngine(BaseEngine):
         # SpecPrefill: pass per-request overrides to engine
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
+        observation_id = kwargs.pop("_observation_id", None)
 
         engine = self._engine
         request_id = await engine.add_request(
             prompt=prompt,
             sampling_params=sampling_params,
             tools=tools,
+            observation_id=observation_id,
             skip_cache_store=bool(kwargs.get("skip_cache_store", False)),
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             benchmark_trace=bool(kwargs.get("benchmark_trace", False)),

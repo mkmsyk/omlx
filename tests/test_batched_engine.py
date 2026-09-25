@@ -361,6 +361,26 @@ class TestBatchedEngineStreamingCleanup:
 
         assert fake_engine.add_request_kwargs["tools"] == tools
 
+    @pytest.mark.asyncio
+    async def test_stream_generate_forwards_observation_id_separately(self):
+        from omlx.engine.batched import BatchedEngine
+
+        fake_engine = FakeStreamingCore()
+        engine = BatchedEngine(model_name="test-model")
+        engine._loaded = True
+        engine._engine = fake_engine
+
+        stream = engine.stream_generate(
+            "hello", _observation_id="r-ticket-correlated"
+        )
+        await stream.__anext__()
+        await stream.aclose()
+
+        assert (
+            fake_engine.add_request_kwargs["observation_id"]
+            == "r-ticket-correlated"
+        )
+
 
 class TestBatchedEngineApplyChatTemplate:
     """Tests for BatchedEngine._apply_chat_template()."""

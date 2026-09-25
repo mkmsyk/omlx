@@ -114,6 +114,9 @@ class Request:
     request_id: str
     prompt: Union[str, List[int]]
     sampling_params: SamplingParams
+    # Opaque caller correlation used only for runtime observability.  This is
+    # deliberately separate from request_id, which keys internal collectors.
+    observation_id: Optional[str] = None
     arrival_time: float = field(default_factory=time.monotonic)
     priority: int = 0  # Lower is higher priority
 
