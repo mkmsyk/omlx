@@ -38,3 +38,14 @@ VLM MTPのdrafterは要求固有状態を持つため、同時所有者を1件�
 - 次の3件は約16分後のモデル切替まで完走せず中断された。混在MTPを速度改善として採用できない。
 - 混雑判定を元へ戻し、MTPは単独入場、翻訳などのelastic処理は3件BatchGeneratorという
   Krisis側の実行形状選択で実現する。並行混在版は本番から撤回した。
+
+## 次回の事前手順
+
+1. MTP所有テストが通っても速度改善とは判定しない。変更前に同一モデル・同一入力種別・同一同時数の
+   baselineを正規のSidekicks → Krisis → oMLX経路で採る。
+2. 混在を試す場合はMTP要求だけでなく、同居する通常要求全件と直後のbatchまで、wall time、token/s、
+   完走・中断・stallを記録する。acceptance rate単独を採否根拠にしない。
+3. MTP使用は設定値や行順から推測せず、oMLXの実観測IDとKrisis推論ticket IDの一致で確認する。
+4. 同居群または直後群が大幅に悪化した場合は、混在範囲を広げず変更を撤回する。MTPはcaller側で
+   単独入場、elastic処理は純BatchGeneratorを既定に戻す。
+5. 上記の実運用比較を通すまでは、schedulerの混雑判定撤去を性能修正として配備しない。
