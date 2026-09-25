@@ -13256,6 +13256,9 @@ class Scheduler:
             "num_waiting": len(self.waiting),
             "num_prefilling": len(self.prefilling),
             "num_running": len(self.running),
+            # VLM MTPは通常のBatchGeneratorとは別の辞書で実行される。
+            # num_runningから推測せず、実際にdrafterを使っている件数を公開する。
+            "vlm_mtp_active_requests": len(self._vlm_mtp_active),
             "num_requests_processed": self.num_requests_processed,
             "total_prompt_tokens": self.total_prompt_tokens,
             "total_completion_tokens": self.total_completion_tokens,

@@ -507,6 +507,19 @@ class TestEnginePoolStatus:
         model_a_status = next(m for m in status["models"] if m["id"] == "model-a")
         assert model_a_status["pinned"] is True
         assert model_a_status["loaded"] is False
+        assert model_a_status["mtp_active_requests"] == 0
+
+    def test_get_status_reports_model_mtp_activity(self, small_mock_model_dir):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        entry = pool.get_entry("model-a")
+        entry.engine = MagicMock()
+        entry.engine.get_stats.return_value = {"vlm_mtp_active_requests": 1}
+
+        status = pool.get_status()
+
+        model = next(row for row in status["models"] if row["id"] == "model-a")
+        assert model["mtp_active_requests"] == 1
 
     def test_get_model_ids(self, small_mock_model_dir):
         """Test get_model_ids returns all model IDs."""

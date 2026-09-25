@@ -3520,6 +3520,12 @@ class EnginePool:
         models = []
         for mid, e in sorted(self._entries.items()):
             deployment = self._distributed_deployment_for_entry(e)
+            engine_stats: dict = {}
+            if e.engine is not None:
+                try:
+                    engine_stats = e.engine.get_stats()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Model stats unavailable for %s: %s", mid, exc)
             models.append(
                 {
                     "id": mid,
@@ -3550,6 +3556,9 @@ class EnginePool:
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
+                    "mtp_active_requests": int(
+                        engine_stats.get("vlm_mtp_active_requests", 0) or 0
+                    ),
                     "prefill_eviction_eligible": self._is_idle_for_prefill_eviction(e),
                 }
             )
