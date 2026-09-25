@@ -108,17 +108,6 @@ Run `python -m pytest -q tests/test_admin_new_profile_expose_as_model.py tests/t
 
 Run `python -m pytest tests/test_mtp_xtc_sampling.py -q` for request sampler changes, late-joining mixed batches, row removal, and greedy sampling. These tests use a small MLX model and observe the MTP eligibility boundary; they do not execute a trained MTP head.
 
-### VLM MTP concurrency changes
-
-Do not treat scheduler ownership tests or acceptance rate as proof of a throughput improvement. Before keeping any change that lets VLM MTP coexist with a normal batch, run real requests through the installed Sidekicks → Krisis → oMLX path and compare all of the following against the unchanged baseline:
-
-- wall time and emitted-token rate of the MTP request;
-- wall time and emitted-token rate of every co-resident normal request;
-- aggregate completed work over the same observation interval;
-- completion, interruption, and stall outcomes for the immediately following batch.
-
-Use the same model, operation mix, input class, and concurrency for both sides. Observe actual MTP ownership by the oMLX request observation ID; do not infer it from configuration or queue position. If any co-resident group regresses severely or later requests stop completing, withdraw the mixed mode before further rollout. The 2026-09-25 Gemma 4 26B trial showed that one MTP owner plus two normal requests could be much slower than a pure three-request batch even though all ownership unit tests passed. Prefer caller-side exclusive admission for MTP until a mixed-mode benchmark demonstrates a net workload gain.
-
 # VLM cache boundary tests
 
 Run `python -m pytest -q tests/test_vlm_cache_boundaries.py tests/test_vlm_engine.py tests/test_prefix_cache.py tests/test_paged_cache.py` to check image-aware prefix keys. Boundary cases cover reasoning-dependent template prefixes, final grid token positions, adjacent images, multiple images per turn, block edges, invalid metadata, and isolation when earlier or later images change. These tests use synthetic processor inputs and KV arrays; checkpoint preprocessing and inference comparisons require local models.

@@ -2078,8 +2078,6 @@ class TestSchedulerStatistics:
 
         assert stats["num_waiting"] == 0
         assert stats["num_running"] == 0
-        assert stats["vlm_mtp_active_requests"] == 0
-        assert stats["vlm_mtp_active_observation_ids"] == []
         assert stats["num_requests_processed"] == 0
         assert stats["total_prompt_tokens"] == 0
         assert stats["total_completion_tokens"] == 0
@@ -2100,27 +2098,6 @@ class TestSchedulerStatistics:
 
         assert stats["num_waiting"] == 3
         assert stats["num_running"] == 0
-
-    def test_get_stats_reports_active_vlm_mtp_requests(self, mock_model, mock_tokenizer):
-        scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
-        scheduler._vlm_mtp_active = {
-            -1: SimpleNamespace(
-                request=SimpleNamespace(observation_id="r-ticket-b")
-            ),
-            -2: SimpleNamespace(
-                request=SimpleNamespace(observation_id="r-ticket-a")
-            ),
-            -3: SimpleNamespace(
-                request=SimpleNamespace(observation_id=None)
-            ),
-        }
-
-        stats = scheduler.get_stats()
-        assert stats["vlm_mtp_active_requests"] == 3
-        assert stats["vlm_mtp_active_observation_ids"] == [
-            "r-ticket-a",
-            "r-ticket-b",
-        ]
 
 
 class TestSchedulerReset:

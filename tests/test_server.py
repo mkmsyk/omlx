@@ -70,20 +70,6 @@ class TestBoundarySnapshotLifecycle:
         assert stale_dir.exists()
 
 
-def test_krisis_observation_id_accepts_only_bounded_canonical_ticket():
-    request = SimpleNamespace(
-        headers={"x-krisis-inference-ticket": "r-ticket-1"}
-    )
-    assert srv._krisis_observation_id(request) == "r-ticket-1"
-
-    invalid = SimpleNamespace(
-        headers={"x-krisis-inference-ticket": "not a ticket"}
-    )
-    with pytest.raises(HTTPException) as exc:
-        srv._krisis_observation_id(invalid)
-    assert exc.value.status_code == 400
-
-
 @pytest.mark.asyncio
 async def test_text_completion_stream_forwards_transport_request_id():
     from omlx.api.openai_models import CompletionRequest

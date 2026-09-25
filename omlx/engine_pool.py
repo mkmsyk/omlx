@@ -2224,16 +2224,9 @@ class EnginePool:
         except AttributeError:
             return None
 
-    def _is_idle_for_prefill_eviction(
-        self, entry: EngineEntry, *, allow_pinned: bool = False
-    ) -> bool:
+    def _is_idle_for_prefill_eviction(self, entry: EngineEntry) -> bool:
         engine = entry.engine
-        if (
-            engine is None
-            or (entry.is_pinned and not allow_pinned)
-            or entry.is_loading
-            or entry.in_use > 0
-        ):
+        if engine is None or entry.is_pinned or entry.is_loading or entry.in_use > 0:
             return False
         if self._entry_has_active_requests(entry):
             return False
@@ -2631,17 +2624,10 @@ class EnginePool:
         return False
 
     async def unload_idle_for_control(self, model_id: str) -> dict:
-        """管制が選んだ候補を再検証する。ここで別の候補を選ばない。
-
-        ``is_pinned`` はstandalone oMLXの常駐方針であり、load/unloadを所有する
-        外部管制の判断を上書きしない。管制入口ではpinだけを越え、active request、
-        scheduler待ち、loading、in-useの再検証は同じlock内で維持する。
-        """
+        """管制が選んだ候補を再検証する。ここで別の候補を選ばない。"""
         async with self._lock:
             entry = self._entries.get(model_id)
-            if entry is None or not self._is_idle_for_prefill_eviction(
-                entry, allow_pinned=True
-            ):
+            if entry is None or not self._is_idle_for_prefill_eviction(entry):
                 return {"ok": False, "skipped": "model_busy_or_missing"}
             await self._unload_engine(model_id)
             return {"ok": True, "model_id": model_id}
@@ -3534,12 +3520,6 @@ class EnginePool:
         models = []
         for mid, e in sorted(self._entries.items()):
             deployment = self._distributed_deployment_for_entry(e)
-            engine_stats: dict = {}
-            if e.engine is not None:
-                try:
-                    engine_stats = e.engine.get_stats()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Model stats unavailable for %s: %s", mid, exc)
             models.append(
                 {
                     "id": mid,
@@ -3570,12 +3550,6 @@ class EnginePool:
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
-                    "mtp_active_requests": int(
-                        engine_stats.get("vlm_mtp_active_requests", 0) or 0
-                    ),
-                    "mtp_active_observation_ids": list(
-                        engine_stats.get("vlm_mtp_active_observation_ids", []) or []
-                    ),
                     "prefill_eviction_eligible": self._is_idle_for_prefill_eviction(e),
                 }
             )

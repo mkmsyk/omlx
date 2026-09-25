@@ -137,12 +137,7 @@ def is_gemma4_model(model_name: str, config: dict[str, Any] | None = None) -> bo
         model_type = config.get("model_type", "")
         # diffusion_gemma shares Gemma 4's wire protocol (channel markers,
         # call:name{...} tool calls), so it uses the same parser/extractor.
-        if model_type in {
-            "gemma4",
-            "gemma4_text",
-            "gemma4_unified",
-            "diffusion_gemma",
-        }:
+        if model_type in {"gemma4", "gemma4_unified", "diffusion_gemma"}:
             logger.debug(f"Gemma 4 model detected via config.model_type: {model_name}")
             return True
         return False

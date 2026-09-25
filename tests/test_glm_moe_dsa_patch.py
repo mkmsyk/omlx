@@ -787,12 +787,7 @@ def test_deepseek_switchglu_uses_affine_block_kernels(monkeypatch):
     if not fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks"):
         pytest.skip("DeepSeek affine block-list kernels are unavailable")
 
-    from omlx.patches.deepseek_v4 import switch_layers
     from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
-
-    # Force the pre-NAX branch under test. Production M5 routing deliberately
-    # uses MLX's NAX gather_qmm at this route count.
-    monkeypatch.setattr(switch_layers, "_nax_prefers_stock", lambda _: False)
 
     mx.random.seed(13)
 
@@ -852,10 +847,7 @@ def test_deepseek_switchglu_uses_fp16_affine_blocks_for_bf16_inputs(monkeypatch)
     if not fast.has_symbol("deepseek_affine_gather_qmm_pair_concat_blocks"):
         pytest.skip("DeepSeek affine block-list kernels are unavailable")
 
-    from omlx.patches.deepseek_v4 import switch_layers
     from omlx.patches.deepseek_v4.switch_layers import SwitchGLU
-
-    monkeypatch.setattr(switch_layers, "_nax_prefers_stock", lambda _: False)
 
     mx.random.seed(19)
 

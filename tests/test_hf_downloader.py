@@ -5,8 +5,6 @@ import asyncio
 import json
 import os
 import shutil
-import subprocess
-import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -468,21 +466,9 @@ class TestHFDownloader:
         driven by ``abort_xet_session()`` instead of the tqdm raise, so the
         module no longer flips ``HF_HUB_DISABLE_XET``.
         """
-        clean_env = os.environ.copy()
-        clean_env.pop("HF_HUB_DISABLE_XET", None)
-        subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import huggingface_hub.constants as hc; "
-                    "import omlx.admin.hf_downloader; "
-                    "raise SystemExit(0 if hc.HF_HUB_DISABLE_XET is False else 1)"
-                ),
-            ],
-            check=True,
-            env=clean_env,
-        )
+        import huggingface_hub.constants as hc
+
+        assert hc.HF_HUB_DISABLE_XET is False
 
     @pytest.mark.asyncio
     async def test_cancel_active_download_aborts_xet_session(self, downloader):
