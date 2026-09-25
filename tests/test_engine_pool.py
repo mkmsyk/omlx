@@ -2383,6 +2383,17 @@ class TestEnginePoolPrefillEviction:
         pool._unload_engine.assert_awaited_once_with("idle")
 
     @pytest.mark.asyncio
+    async def test_conditional_control_unload_overrides_standalone_pin(self):
+        pool = _make_pool(ceiling=0)
+        pool._entries = {"idle": self._entry("idle", 60)}
+        pool._entries["idle"].is_pinned = True
+        pool._unload_engine = AsyncMock()
+
+        assert pool._is_idle_for_prefill_eviction(pool._entries["idle"]) is False
+        assert (await pool.unload_idle_for_control("idle"))["ok"] is True
+        pool._unload_engine.assert_awaited_once_with("idle")
+
+    @pytest.mark.asyncio
     async def test_prefill_eviction_evicts_idle_lru_until_target(self):
         gb = 1024**3
         pool = _make_pool(ceiling=0)

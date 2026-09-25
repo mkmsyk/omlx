@@ -13,6 +13,7 @@
 
 ## 内部作業ログ
 
+| [session-managed-unload-pinned-model-20260925.md](internal/session-managed-unload-pinned-model-20260925.md) | 外部管制の条件付き退避がstandaloneのpinに阻害される契約不整合を修復した記録 |
 | [session-mtp-runtime-observability-20260925.md](internal/session-mtp-runtime-observability-20260925.md) | MTPの実デコード中件数とKrisis推論チケット相関IDをモデル別状態APIへ公開した記録 |
 | [session-structured-translation-20260919.md](internal/session-structured-translation-20260919.md) | TranslateGemma structured content保持の実装判断と検証 |
 
