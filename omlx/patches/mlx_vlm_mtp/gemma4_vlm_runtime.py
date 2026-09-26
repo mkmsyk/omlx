@@ -161,6 +161,81 @@ def _align_drafter_dtype(drafter: Any, dtype: Any) -> None:
     logger.info("gemma4 vlm assistant head aligned to %s", dtype)
 
 
+class _CommittedRotating:
+    """Placeholder left in a transaction for a rotating cache already committed."""
+
+    def validate(self, lengths) -> None:  # noqa: D401 - transaction protocol
+        return None
+
+    def commit(self, lengths, length) -> None:
+        return None
+
+    def abort(self) -> None:
+        return None
+
+
+def _commit_rotating_in_place(transaction: Any, retained: list[int]) -> None:
+    """Commit ragged accepts of a shared verify on its rotating caches in place.
+
+    mlx-vlm's rotating transaction restores the pre-verify window and replays
+    the accepted keys under ``prepare(right_padding)`` + ``finalize()``: two
+    window copies plus the finalize roll per sliding layer, about 1.5 ms per
+    Gemma 4 31B sliding layer at three rows (75 ms per cycle over 50 layers).
+
+    A verify block of ``L >= 2`` tokens goes through ``_update_concat``, which
+    leaves the window in temporal order with the block at its tail. The
+    replayed state therefore equals the verify state with the rejected tail
+    cut off (a cursor move) and every row that kept fewer tokens rolled right
+    by its shortfall, with ``left_padding`` / ``offset`` adjusted exactly as
+    ``finalize`` does. Rotating caches whose verify did not match that shape
+    are left to the stock commit.
+    """
+    from mlx_vlm.models.cache import BatchRotatingKVCache, dynamic_roll
+
+    length = int(transaction.length)
+    keep = max(retained)
+    if keep == length and min(retained) == length:
+        return  # full accept: the stock commit only restores the method
+    shortfall = [keep - value for value in retained]
+    rotating = getattr(transaction, "_rotating", {})
+    for key, entry in list(rotating.items()):
+        cache = getattr(entry, "cache", None)
+        updates = getattr(entry, "updates", None)
+        if (
+            type(cache) is not BatchRotatingKVCache
+            or not updates
+            or len(updates) != 1
+            or int(updates[0][0].shape[2]) != length
+            or length < 2
+            or cache.rotated
+            or cache._lengths is not None
+            or cache.keys is None
+            or int(cache.keys.shape[0]) != len(retained)
+        ):
+            continue
+        # Drop the transaction's method override (as its commit does).
+        if "update_and_fetch" in entry.original:
+            cache.update_and_fetch = entry.original["update_and_fetch"]
+        else:
+            cache.__dict__.pop("update_and_fetch", None)
+        tail = length - keep
+        if tail:
+            cache._offset -= tail
+            cache._idx -= tail
+            cache.offset = cache.offset - tail
+            cache.keys = cache.keys[..., : cache._idx, :]
+            cache.values = cache.values[..., : cache._idx, :]
+        if any(shortfall):
+            shift = mx.array(shortfall, dtype=cache.offset.dtype)
+            cache.keys = dynamic_roll(cache.keys, shift[:, None], axis=2)
+            cache.values = dynamic_roll(cache.values, shift[:, None], axis=2)
+            cache.left_padding = cache.left_padding + shift
+            cache.offset = cache.offset - shift
+        cache._mtp_undo = None
+        entry.updates.clear()
+        rotating[key] = _CommittedRotating()
+
+
 def _draft_forward(drafter: Any, inputs_embeds, shared_kv, position: int, kv_valid_len: int):
     """``Gemma4AssistantDraftModel.__call__`` for one row at a host position.
 
@@ -310,6 +385,13 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
     def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
         """Commit ragged accepts through the verify transaction when present."""
         if isinstance(gdn_states, SpeculativeCacheTransaction):
+            if gdn_states.active and int(block_size) == int(gdn_states.length):
+                values = (
+                    [int(accepted)]
+                    if isinstance(accepted, int)
+                    else [int(v) for v in (accepted.tolist() if isinstance(accepted, mx.array) else accepted)]
+                )
+                _commit_rotating_in_place(gdn_states, [v + 1 for v in values])
             return rollback_cache_transaction(caches, gdn_states, accepted, block_size)
         return original_rollback(self, caches, gdn_states, accepted, block_size)
 
