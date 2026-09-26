@@ -460,8 +460,42 @@ def apply_verify_qmm_patch() -> bool:
         return True
 
     orig_call = cls.__call__
+    from . import verify_qmm_nax
+
+    def nax_route(x, weight, scales, biases, bits, group_size):
+        """Multi-row 6-bit verify (rows x depth > 4) on the NAX tile kernel."""
+        rows = 1
+        for dim in x.shape[:-1]:
+            rows *= int(dim)
+        if not (
+            _is_armed()
+            and verify_qmm_nax.eligible(
+                rows, x.shape[-1], weight.shape[0], bits, group_size, x.dtype
+            )
+            and verify_qmm_nax.available()
+        ):
+            return None
+        try:
+            y = verify_qmm_nax.verify_qmm(
+                x.reshape(rows, x.shape[-1]),
+                weight,
+                scales,
+                biases,
+                bits=bits,
+                group_size=group_size,
+            )
+        except Exception:
+            logger.debug("verify qmm NAX route failed; stock fallback", exc_info=True)
+            return None
+        return y.reshape(*x.shape[:-1], weight.shape[0])
 
     def patched_call(self, x):
+        if getattr(self, "mode", "affine") == "affine":
+            y = nax_route(
+                x, self.weight, self.scales, self.biases, self.bits, self.group_size
+            )
+            if y is not None:
+                return y + self.bias if hasattr(self, "bias") else y
         if (
             _is_armed()
             and x.ndim == 3
@@ -496,6 +530,24 @@ def apply_verify_qmm_patch() -> bool:
 
     cls.__call__ = patched_call
     cls._omlx_verify_qmm_patched = True
+
+    # Tied-embedding logits (Gemma 4) run through QuantizedEmbedding.as_linear.
+    emb = nn.QuantizedEmbedding
+    orig_as_linear = emb.as_linear
+
+    def patched_as_linear(self, x):
+        if getattr(self, "mode", "affine") == "affine":
+            y = nax_route(
+                x, self.weight, self.scales, self.biases, self.bits, self.group_size
+            )
+            if y is not None:
+                return y
+        return orig_as_linear(self, x)
+
+    emb.as_linear = patched_as_linear
     _QL_PATCHED = True
-    logger.info("MTP verify qmm patch applied (M=2..6 affine 4/8-bit)")
+    logger.info(
+        "MTP verify qmm patch applied (M=2..6 affine 4/8-bit; "
+        "M=5..16 affine 6-bit on NAX)"
+    )
     return True
