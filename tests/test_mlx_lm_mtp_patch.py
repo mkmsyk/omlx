@@ -4961,6 +4961,65 @@ def test_shared_verify_boundary_emit_uses_private_row_cache(monkeypatch, family)
         mlx_lm_mtp.set_mtp_depth(previous_depth)
 
 
+@pytest.mark.parametrize("rows_draft", [True, False])
+def test_gemma_boundary_emit_runs_after_every_row_drafted(monkeypatch, rows_draft):
+    """A boundary forward replaces Gemma's shared capture; drafts come first."""
+    from omlx.patches.mlx_lm_mtp import fused_batch
+
+    previous = mlx_lm_mtp.is_mtp_active()
+    previous_depth = mlx_lm_mtp.get_mtp_depth()
+    mlx_lm_mtp.set_mtp_active(True)
+    mlx_lm_mtp.set_mtp_depth(2)
+    if not rows_draft:
+        # Per-row drafting: no common depth policy.
+        monkeypatch.setattr(bg, "_batch_policy_for_next", lambda batch: None)
+    try:
+        mx.random.seed(173)
+        model = _model("gemma")
+        host = model._language_model
+        mx.eval(model.parameters())
+        prompts = [[3, 4, 5, 6, 7], [3, 6, 7, 8, 4, 5, 6], [4, 5, 6]]
+        limits = [18, 22, 17]
+        host._omlx_mtp_decode_enabled = False
+        expected, _ = generate(model, prompts, limits)
+        host._omlx_mtp_decode_enabled = True
+        model._omlx_mtp_commit_align = 4
+        materialized, stale = [], []
+        original_materialize = bg._materialize_mtp_boundary_emit
+
+        def materialize(row, state):
+            materialized.append(state.uid)
+            return original_materialize(row, state)
+
+        original_forward = type(host).mtp_forward
+
+        def checked_forward(self, *args, **kwargs):
+            if getattr(self, "_omlx_mtp_draft_row", None) is not None and not self.mtp_rows_ready(
+                getattr(self, "_omlx_mtp_capture_info", (0,))[0]
+            ):
+                stale.append(self.mtp_capture_report())
+            return original_forward(self, *args, **kwargs)
+
+        original_rows = batched_head.draft_stateless
+
+        def checked_rows(batch, jobs):
+            if not host.mtp_rows_ready(len(jobs)):
+                stale.append(host.mtp_capture_report())
+            return original_rows(batch, jobs)
+
+        monkeypatch.setattr(bg, "_materialize_mtp_boundary_emit", materialize)
+        monkeypatch.setattr(type(host), "mtp_forward", checked_forward)
+        monkeypatch.setattr(batched_head, "draft_stateless", checked_rows)
+        actual, _ = generate(model, prompts, limits)
+        assert actual == expected
+        assert materialized, "the short generation must cross a boundary"
+        assert not stale, stale
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
+        mlx_lm_mtp.set_mtp_depth(previous_depth)
+        fused_batch._set_draft_row(model, None)
+
+
 @pytest.mark.parametrize("batch", [1, 2])
 def test_lightning_verify_preserves_quantized_linear_dispatch(monkeypatch, batch):
     from mlx_vlm.models.qwen3_5 import speculative_verifier

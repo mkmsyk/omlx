@@ -3144,8 +3144,14 @@ def _run_verify_cycle_chain(
     greedy_result=None,
     stochastic_result=None,
     draft_jobs=None,
+    defer_boundary=False,
 ) -> None:
     """One depth-k verify cycle.
+
+    ``defer_boundary`` leaves a boundary token pending
+    (``state.boundary_emit_pending``) for the caller to materialize after
+    every row of a shared verify has drafted: the boundary forward replaces
+    the backbone's capture that heads such as Gemma 4's draft against.
 
     Verify ``[next_main, d1..dk]`` in a single backbone forward with
     ``n_confirmed=1``. Greedy acceptance is computed in-graph, so the whole
@@ -3377,7 +3383,7 @@ def _run_verify_cycle_chain(
             draft_jobs.append((gen_batch, state, hidden_rows, committed, prev_buf))
         state.next_main = next_main
         state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
-        if materialize_boundary_emit:
+        if materialize_boundary_emit and not defer_boundary:
             _materialize_mtp_boundary_emit(gen_batch, state)
             state.boundary_emit_pending = False
         if state.controller is not None:

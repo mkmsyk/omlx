@@ -251,6 +251,7 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
             stochastic_result=(
                 None if stochastic_results is None else stochastic_results[row_index]
             ),
+            defer_boundary=True,
         )
         if vector_rollback:
             deferred.append(result)
@@ -281,5 +282,15 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         else:
             batched_head.draft(batch, draft_jobs)
     _set_draft_row(batch.model, None)
+    # Boundary tokens are committed with a one-row forward that replaces the
+    # shared capture, so they run once every row has drafted from it. Each
+    # redrafts its own row from the boundary forward (its private cache).
+    for index, row, state in rows:
+        if state.boundary_emit_pending:
+            bg._set_singleton_mrope_delta(row)
+            bg._materialize_mtp_boundary_emit(row, state)
+            state.boundary_emit_pending = False
+            replacements[index] = row.prompt_cache
+            batch._token_context[index] = row._token_context[0]
     bg._clear_rollback(cache)
     return vector_rollback and whole_batch and not replacements
