@@ -4219,6 +4219,27 @@ def test_gemma_batched_draft_rows_match_singleton_drafts(accepted, monkeypatch):
             )
             assert mx.allclose(chained[row : row + 1], single_step, atol=1e-3, rtol=1e-3), row
         fused_batch._set_draft_row(model, None)
+        assert host.mtp_rows_ready(2) and not host.mtp_rows_ready(3)
+        assert host.mtp_capture_report().startswith("batched capture rows=2")
+
+        # A singleton forward replacing the capture is reported by caller and
+        # makes a rows draft fall back to an empty (plain-step) chain.
+        _, _, _ = bg._call_backbone(model, mx.array([[7, 8]]), prefill(prompts[0]), n_confirmed=1)
+        assert not host.mtp_rows_ready(2)
+        report = host.mtp_capture_report()
+        assert report.startswith("singleton capture rows=1 tokens=2 by ")
+        assert "_call_backbone" in report
+
+        class _State:
+            depth = 2
+            drafts = None
+            draft_lps = None
+            draft_accept_lps = None
+
+        states = [_State(), _State()]
+        jobs = [(None, s, None, mx.array([1], dtype=mx.uint32), None) for s in states]
+        batched_head.draft_stateless(SimpleNamespace(model=model), jobs)
+        assert all(s.drafts.shape == (0,) and s.draft_lps == [] for s in states)
 
         for row, m in enumerate(accepted):
             cache = prefill(prompts[row])

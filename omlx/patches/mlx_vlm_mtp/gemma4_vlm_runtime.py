@@ -277,6 +277,26 @@ def _draft_forward(drafter: Any, inputs_embeds, shared_kv, position: int, kv_val
     return last_hidden, logits
 
 
+def _caller_summary(limit: int = 7) -> str:
+    """Short call chain (function names) of the current frame's callers."""
+    import sys
+
+    names = []
+    frame = sys._getframe(2)
+    while frame is not None and len(names) < limit:
+        names.append(frame.f_code.co_name)
+        frame = frame.f_back
+    return " < ".join(names)
+
+
+def batched_capture_rows(host: Any) -> int:
+    """Row count of the host's current shared-K/V capture (0 when singleton)."""
+    if getattr(host, "_omlx_mtp_row_offsets", None) is None:
+        return 0
+    info = getattr(host, "_omlx_mtp_capture_info", None)
+    return int(info[0]) if info else 0
+
+
 def _draft_rows_context(drafter: Any, banks_by_row: list, committed: list[int]):
     """Padded shared K/V, masks and RoPE offsets for drafting several rows.
 
@@ -426,6 +446,13 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         self._omlx_mtp_shared_kv = sink
         self._omlx_mtp_cache_ref = cache
         self._omlx_mtp_row_spans = None
+        # Which forward owns the capture; a batched draft checks it (and a
+        # mismatch report names the caller that replaced it).
+        self._omlx_mtp_capture_info = (
+            int(inputs.shape[0]),
+            int(inputs.shape[1]),
+            "" if batched else _caller_summary(),
+        )
         if batched:
             # Per-row processed lengths at capture. Every row of a stashed
             # bank ends at the same (right-aligned) slot, so a row's
@@ -656,6 +683,18 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         head_hidden, logits = _draft_forward_rows(drafter, inputs_embeds, spans_ctx[1])
         return logits, head_hidden
 
+    def mtp_rows_ready(self, rows: int) -> bool:
+        """Whether the current capture is a shared verify of ``rows`` rows."""
+        return batched_capture_rows(self) == int(rows)
+
+    def mtp_capture_report(self) -> str:
+        info = getattr(self, "_omlx_mtp_capture_info", None)
+        if not info:
+            return "no capture"
+        rows, length, caller = info
+        kind = "batched" if getattr(self, "_omlx_mtp_row_offsets", None) is not None else "singleton"
+        return f"{kind} capture rows={rows} tokens={length}" + (f" by {caller}" if caller else "")
+
     def make_mtp_cache(self):
         """The assistant head keeps no state — nothing to clone or trim."""
         return []
@@ -665,6 +704,8 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
     cls.rollback_speculative_cache = rollback_speculative_cache
     cls.mtp_forward = mtp_forward
     cls.mtp_forward_rows = mtp_forward_rows
+    cls.mtp_rows_ready = mtp_rows_ready
+    cls.mtp_capture_report = mtp_capture_report
     cls.make_mtp_cache = make_mtp_cache
     # Shared verification: rows keep request-local acceptance and draft
     # context; the verify transaction commits ragged accepts per row.

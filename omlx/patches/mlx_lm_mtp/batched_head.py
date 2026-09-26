@@ -217,6 +217,17 @@ def draft_stateless(batch, jobs):
     host = _rows_host(batch.model)
     states = [job[1] for job in jobs]
     depth = states[0].depth
+    ready = getattr(host, "mtp_rows_ready", None)
+    if depth and callable(ready) and not ready(len(jobs)):
+        # The shared capture was replaced before drafting. Skip this cycle's
+        # drafts (a plain step) rather than draft against the wrong keys.
+        report = getattr(host, "mtp_capture_report", lambda: "unknown")()
+        bg.logger.warning(
+            "Lightning MTP rows draft skipped: expected a %d-row shared capture, found %s",
+            len(jobs),
+            report,
+        )
+        depth = 0
     if depth == 0:
         # Mirrors _chain_next_drafts for a stateless head at depth 0.
         for state in states:
