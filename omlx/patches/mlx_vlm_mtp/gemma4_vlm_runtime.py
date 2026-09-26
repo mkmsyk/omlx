@@ -297,46 +297,44 @@ def batched_capture_rows(host: Any) -> int:
     return int(info[0]) if info else 0
 
 
-def _draft_rows_context(drafter: Any, banks_by_row: list, committed: list[int]):
-    """Padded shared K/V, masks and RoPE offsets for drafting several rows.
+def _draft_rows_context(drafter: Any, capture: dict, rows: list[int], bounds: list, committed: list[int]):
+    """Shared K/V, masks and RoPE offsets for drafting several capture rows.
 
-    Each row's span is the compact singleton layout (``_row_shared_kv``):
-    the full-attention bank holds exactly the row's committed tokens and the
-    sliding bank its last window. Rows are right-padded to a common length
-    and masked so every row attends to the same keys, at the same local
-    query position, as its singleton draft (``make_drafter_masks`` with
-    ``_local_window_offset``).
+    The drafter reads the batched capture in place (no per-row copies).
+    Row ``r``'s singleton draft sees its span ``[start, end)`` of each bank
+    (``_row_span_bounds``) at local query position ``min(c - 1, end -
+    start)`` (``make_drafter_masks`` / ``_local_window_offset``); the masks
+    admit exactly those keys, and for sliding layers the same bidirectional
+    window around that local position.
     """
-    from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
-        bidirectional_full_mask,
-        bidirectional_swa_mask,
-    )
-
     window = drafter.config.text_config.sliding_window
-    padded, masks = {}, {}
-    for layer_type in banks_by_row[0]:
-        lengths = [int(b[layer_type][0].shape[-2]) for b in banks_by_row]
-        width = max(lengths)
-
-        def pad(x, n):
-            return x if n == width else mx.pad(x, [(0, 0), (0, 0), (0, width - n), (0, 0)])
-
-        keys = mx.concatenate([pad(b[layer_type][0], n) for b, n in zip(banks_by_row, lengths)])
-        values = mx.concatenate([pad(b[layer_type][1], n) for b, n in zip(banks_by_row, lengths)])
-        padded[layer_type] = (keys, values)
-        valid = mx.array(lengths, dtype=mx.int32)
-        dtype = keys.dtype
+    index = None if rows == list(range(len(rows))) and _capture_rows(capture) == len(rows) else mx.array(rows)
+    shared, masks = {}, {}
+    for layer_type, (keys, values) in capture.items():
+        if index is not None:
+            keys, values = keys[index], values[index]
+        shared[layer_type] = (keys, values)
+        width = int(keys.shape[-2])
+        start = mx.array([b[layer_type][0] for b in bounds], dtype=mx.int32)[:, None]
+        end = mx.array([b[layer_type][1] for b in bounds], dtype=mx.int32)[:, None]
+        pos = mx.arange(width, dtype=mx.int32)[None, :]
+        inside = (pos >= start) & (pos < end)
         if layer_type == "sliding_attention":
-            query = mx.array(
-                [min(c - 1, n) for c, n in zip(committed, lengths)], dtype=mx.int32
-            )
-            masks[layer_type] = bidirectional_swa_mask(
-                1, query, width, window, valid, 0, dtype
-            )
-        else:
-            masks[layer_type] = bidirectional_full_mask(1, width, valid, 0, dtype)
+            local_q = mx.array(
+                [min(c - 1, b[layer_type][1] - b[layer_type][0]) for c, b in zip(committed, bounds)],
+                dtype=mx.int32,
+            )[:, None]
+            dist = local_q - (pos - start)
+            inside = inside & (dist > -window) & (dist < window)
+        bias = mx.where(inside, mx.array(0.0, dtype=keys.dtype), mx.array(-mx.inf, dtype=keys.dtype))
+        masks[layer_type] = bias[:, None, None, :]
     offset = mx.array([max(c - 1, 0) for c in committed], dtype=mx.int32)
-    return padded, masks, offset
+    return shared, masks, offset
+
+
+def _capture_rows(capture: dict) -> int:
+    keys, _ = next(iter(capture.values()))
+    return int(keys.shape[0])
 
 
 def _draft_forward_rows(drafter: Any, inputs_embeds, context):
@@ -510,6 +508,23 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         each request's draft chain queues without waiting for the previous
         row's GPU work.
         """
+        spans = _capture_spans(self)
+        banks = spans["banks"].get(row)
+        bounds, committed = _row_span_bounds(self, row)
+        if banks is not None:
+            return banks, committed
+        banks = {}
+        for layer_type, (keys, values) in self._omlx_mtp_shared_kv.items():
+            start, end = bounds[layer_type]
+            banks[layer_type] = (
+                keys[row : row + 1, :, start:end, :],
+                values[row : row + 1, :, start:end, :],
+            )
+        spans["banks"][row] = banks
+        return banks, committed
+
+    def _capture_spans(self):
+        """Per-cycle row lengths of the batched capture (one host sync)."""
         spans = self._omlx_mtp_row_spans
         if spans is None:
             captured, committed = mx.stack(
@@ -523,30 +538,28 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
                 "committed": [int(v) for v in committed],
                 "banks": {},
             }
-        banks = spans["banks"].get(row)
+        return spans
+
+    def _row_span_bounds(self, row: int):
+        """``({layer_type: (start, end)}, committed)`` of a row in the capture."""
+        spans = _capture_spans(self)
         committed = spans["committed"][row]
-        if banks is not None:
-            return banks, committed
         rejected = spans["captured"][row] - committed
         if rejected < 0:
             raise RuntimeError(
                 f"gemma4 batched MTP: row {row} grew after capture "
                 f"({spans['captured'][row]} -> {committed})"
             )
-        banks = {}
-        for layer_type, (keys, values) in self._omlx_mtp_shared_kv.items():
+        bounds = {}
+        for layer_type, (keys, _values) in self._omlx_mtp_shared_kv.items():
             end = int(keys.shape[-2]) - rejected
             start = max(end - committed, 0)
             if end <= start:
                 raise RuntimeError(
                     f"gemma4 batched MTP: empty {layer_type} span for row {row}"
                 )
-            banks[layer_type] = (
-                keys[row : row + 1, :, start:end, :],
-                values[row : row + 1, :, start:end, :],
-            )
-        spans["banks"][row] = banks
-        return banks, committed
+            bounds[layer_type] = (start, end)
+        return bounds, committed
 
     def _mtp_query_position(self) -> int:
         """Current committed length = the drafter's constant query position.
@@ -673,12 +686,17 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         if self._omlx_mtp_row_spans is not None:
             spans_ctx = self._omlx_mtp_row_spans.get("rows_ctx")
         if spans_ctx is None or spans_ctx[0] != key:
-            banks, committed = [], []
+            bounds, committed = [], []
             for row in key:
-                bank, valid = _row_shared_kv(self, row)
-                banks.append(bank)
+                bound, valid = _row_span_bounds(self, row)
+                bounds.append(bound)
                 committed.append(valid)
-            spans_ctx = (key, _draft_rows_context(drafter, banks, committed))
+            spans_ctx = (
+                key,
+                _draft_rows_context(
+                    drafter, self._omlx_mtp_shared_kv, list(key), bounds, committed
+                ),
+            )
             self._omlx_mtp_row_spans["rows_ctx"] = spans_ctx
         head_hidden, logits = _draft_forward_rows(drafter, inputs_embeds, spans_ctx[1])
         return logits, head_hidden

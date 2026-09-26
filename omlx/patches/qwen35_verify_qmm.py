@@ -548,6 +548,6 @@ def apply_verify_qmm_patch() -> bool:
     _QL_PATCHED = True
     logger.info(
         "MTP verify qmm patch applied (M=2..6 affine 4/8-bit; "
-        "M=5..16 affine 6-bit on NAX)"
+        "M=5..32 affine 6-bit on NAX)"
     )
     return True

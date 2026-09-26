@@ -46,6 +46,18 @@ def test_matches_stock_qmm(rows, n, k):
     assert ok, (rows, n, k, verify_qmm_nax.geometry(n, k, 64), err)
 
 
+@pytest.mark.parametrize("rows", [17, 24, 32])
+def test_deep_verify_rows_use_one_32_row_block(rows):
+    # Narrow output + K split: the shape MLX's matrix path starves on.
+    wq, s, b = _quantized(256, 8192)
+    assert verify_qmm_nax.eligible(rows, 8192, 256, 6, 64, mx.bfloat16)
+    x = mx.random.normal((rows, 8192), key=mx.random.key(rows)).astype(mx.bfloat16)
+    ref = mx.quantized_matmul(x, wq, s, b, transpose=True, group_size=64, bits=6)
+    got = verify_qmm_nax.verify_qmm(x, wq, s, b, bits=6, group_size=64)
+    assert _close(got, ref)[0]
+    assert verify_qmm_nax.row_block(rows) == 32
+
+
 def test_group_size_32_uses_small_k_block():
     wq, s, b = _quantized(128, 2048, group_size=32)
     x = mx.random.normal((9, 2048)).astype(mx.bfloat16)
@@ -59,7 +71,9 @@ def test_eligibility_bounds():
     assert ok(5, 1024, 256, 6, 64, mx.bfloat16)
     assert ok(16, 1024, 256, 6, 64, mx.float16)
     assert not ok(4, 1024, 256, 6, 64, mx.bfloat16)  # stock is flat to M=4
-    assert not ok(17, 1024, 256, 6, 64, mx.bfloat16)
+    assert not ok(17, 1024, 256, 6, 64, mx.bfloat16)  # wide / no K split: stock NAX
+    assert ok(24, 8192, 256, 6, 64, mx.bfloat16)  # narrow + K split keeps routing
+    assert not ok(33, 8192, 256, 6, 64, mx.bfloat16)
     assert not ok(8, 1024, 256, 4, 64, mx.bfloat16)  # 4/8-bit keep their route
     assert not ok(8, 1000, 256, 6, 64, mx.bfloat16)
     assert not ok(8, 1024, 250, 6, 64, mx.bfloat16)

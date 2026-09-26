@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NAX quantized matmul for multi-row speculative verify (M = 5..16).
+"""NAX quantized matmul for multi-row speculative verify (M = 5..32).
 
 A Lightning MTP verify multiplies ``rows x (depth + 1)`` activations against
 the model's quantized weights. MLX 0.32.2 serves up to four rows with one
@@ -12,7 +12,7 @@ MLP down 21504->5376 0.18 / 0.32 / 0.47 ms, lm_head 5376->262144
 This module instantiates MLX's own NAX tile path (``QuantizedBlockLoader``
 dequantizing into threadgroup memory + ``tile_matmad_nax`` on the M5 neural
 accelerators, the code behind ``affine_qmm_t_nax``) through
-``mx.fast.metal_kernel`` with a 16-row block, the simdgroups spread along N,
+``mx.fast.metal_kernel`` with a 16- or 32-row block, the simdgroups spread along N,
 and an explicit K split (grid z) whose fp32 partials are summed afterwards.
 Measured on the same shapes at 12 rows: MLP down ~0.49 ms, lm_head ~4.6 ms,
 roughly flat from 8 to 16 rows.
@@ -40,8 +40,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 MIN_ROWS = 5
-MAX_ROWS = 16
-BM = 16
+MAX_ROWS = 32
 
 _KERNEL_CACHE: dict = {}
 _AVAILABLE: bool | None = None
@@ -155,10 +154,19 @@ def _header() -> str:
     )
 
 
-def _build_kernel(bits: int, group_size: int, dtype, out_dtype, bn: int, bk: int, wn: int):
+def row_block(m: int) -> int:
+    """Smallest 16/32-row block holding every verify row in one tile.
+
+    A second row block re-reads every weight tile, which doubled the cost at
+    17 rows with a fixed 16-row block.
+    """
+    return 16 if m <= 16 else 32
+
+
+def _build_kernel(bits: int, group_size: int, dtype, out_dtype, bm: int, bn: int, bk: int, wn: int):
     import mlx.core as mx
 
-    key = (bits, group_size, dtype, out_dtype, bn, bk, wn)
+    key = (bits, group_size, dtype, out_dtype, bm, bn, bk, wn)
     kernel = _KERNEL_CACHE.get(key)
     if kernel is not None:
         return kernel
@@ -177,7 +185,7 @@ def _build_kernel(bits: int, group_size: int, dtype, out_dtype, bn: int, bk: int
 
         auto wl = (const device uint8_t*)w_q;
         wl += k_start * bytes_per_pack / pack_factor;
-        omlx_vqmm_nax_impl<T, O, {group_size}, {bits}, {BM}, BK_, BN_, {wn}>(
+        omlx_vqmm_nax_impl<T, O, {group_size}, {bits}, {bm}, BK_, BN_, {wn}>(
             (const device uint32_t*)wl,
             scales + k_start / {group_size},
             biases + k_start / {group_size},
@@ -191,7 +199,7 @@ def _build_kernel(bits: int, group_size: int, dtype, out_dtype, bn: int, bk: int
     tags = {mx.bfloat16: "bf16", mx.float16: "fp16", mx.float32: "f32"}
     kernel = mx.fast.metal_kernel(
         name=(
-            f"omlx_vqmm_nax_q{bits}_gs{group_size}_n{bn}k{bk}w{wn}_"
+            f"omlx_vqmm_nax_q{bits}_gs{group_size}_m{bm}n{bn}k{bk}w{wn}_"
             f"{tags.get(dtype, 'unk')}_{tags.get(out_dtype, 'unk')}"
         ),
         input_names=["x", "w_q", "scales", "biases", "K_size", "N_size", "M_size", "k_part_size"],
@@ -220,14 +228,18 @@ def geometry(n: int, k: int, group_size: int) -> tuple[int, int, int, int]:
 def eligible(rows: int, k: int, n: int, bits: int, group_size: int, dtype) -> bool:
     import mlx.core as mx
 
-    return (
+    if not (
         int(bits) == 6
         and int(group_size) in (32, 64, 128)
         and dtype in (mx.bfloat16, mx.float16)
         and MIN_ROWS <= int(rows) <= MAX_ROWS
         and int(k) % 64 == 0
         and int(n) % 64 == 0
-    )
+    ):
+        return False
+    # Past 16 rows MLX's own NAX matrix path serves wide outputs as well as
+    # this kernel; it still lacks a K split, so narrow outputs keep routing.
+    return int(rows) <= 16 or geometry(int(n), int(k), int(group_size))[3] > 1
 
 
 def _run(x2, w_q, scales, biases, *, bits: int, group_size: int):
@@ -236,12 +248,13 @@ def _run(x2, w_q, scales, biases, *, bits: int, group_size: int):
     m, k = int(x2.shape[0]), int(x2.shape[1])
     n = int(w_q.shape[0])
     bn, bk, wn, split = geometry(n, k, group_size)
+    bm = row_block(m)
     out_dtype = x2.dtype if split == 1 else mx.float32
-    kernel = _build_kernel(bits, group_size, x2.dtype, out_dtype, bn, bk, wn)
+    kernel = _build_kernel(bits, group_size, x2.dtype, out_dtype, bm, bn, bk, wn)
     (y,) = kernel(
         inputs=[mx.contiguous(x2), w_q, scales, biases, k, n, m, k // split],
         template=[("T", x2.dtype), ("O", out_dtype)],
-        grid=(32 * wn * (n // bn), (m + BM - 1) // BM, split),
+        grid=(32 * wn * (n // bn), (m + bm - 1) // bm, split),
         threadgroup=(32 * wn, 1, 1),
         output_shapes=[(split, m, n)],
         output_dtypes=[out_dtype],
@@ -278,5 +291,5 @@ def available() -> bool:
 
 
 def verify_qmm(x2, w_q, scales, biases, *, bits: int, group_size: int):
-    """(M, K) x (N, K)^T -> (M, N) for 6-bit affine weights, M in 5..16."""
+    """(M, K) x (N, K)^T -> (M, N) for 6-bit affine weights, M in 5..32."""
     return _run(x2, w_q, scales, biases, bits=bits, group_size=group_size)
