@@ -75,6 +75,8 @@ Gemma 4（26B-A4B qat 6bit、31B 6bit）で、同じモデルへの同時要求�
 
 - head は状態を持たない（`make_mtp_cache() == []`）ため、既存の `batched_head`（head cache 前提）はそのまま使えない。状態なし head 用の分岐を `batched_head.draft` に足し、共有 verify 直後に全行の fold と chain 下書きを 1 回の head 呼び出しで行う。
 - 採択数・深さが揃わない行は、既存の group 分け（同じ深さごとに検証）に従う。
+- 設計メモ（2026-09-26 調査）：行 r の区間（full は確定長 c_r、sliding は s_r = min(c_r, bank長 − 棄却数)）を右詰めで最大長へパディングし、mask は `make_drafter_masks` を使わずに組む。full は `bidirectional_full_mask(kv_valid_len=c_r)`、sliding は `bidirectional_swa_mask(query_offset=min(c_r − 1, s_r), kv_valid_len=s_r)` を行ベクトルで渡す。単発の局所座標（`_local_window_offset`）と同じ注意範囲になる。position_ids は行ごとに c_r − 1。
+- 要否の判定：Lightning のログ `MTP[...] timing[... mtp=...]` の head 時間が、行数に比例して本体 verify 時間の 3 割を超えるなら実装する。
 
 2.4 **verify 用 attention 近似の扱い**（`gemma4_verify_attention.py`）
 
