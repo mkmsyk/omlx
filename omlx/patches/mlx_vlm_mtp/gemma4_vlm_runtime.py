@@ -161,6 +161,47 @@ def _align_drafter_dtype(drafter: Any, dtype: Any) -> None:
     logger.info("gemma4 vlm assistant head aligned to %s", dtype)
 
 
+def _draft_forward(drafter: Any, inputs_embeds, shared_kv, position: int, kv_valid_len: int):
+    """``Gemma4AssistantDraftModel.__call__`` for one row at a host position.
+
+    The stock forward reads a single row's query position back with
+    ``position_ids[0, 0].item()``, a host sync on the serial stream that
+    waits for every queued verify and draft kernel. The Lightning cycle
+    already holds the position as a host int, so build the same masks and
+    layer calls from it and keep the draft chain asynchronous.
+    """
+    from mlx_vlm.speculative.drafters.gemma4_assistant.masks import make_drafter_masks
+
+    text_cfg = drafter.config.text_config
+    h = drafter.pre_projection(inputs_embeds)
+    masks = make_drafter_masks(
+        shared_kv,
+        query_len=h.shape[1],
+        query_offset=position,
+        sliding_window=text_cfg.sliding_window,
+        dtype=h.dtype,
+        kv_valid_len=kv_valid_len,
+    )
+    offset = mx.array(position)
+    for layer in drafter.model.layers:
+        h, _, _ = layer(
+            h,
+            mask=masks[layer.layer_type],
+            cache=None,
+            per_layer_input=None,
+            shared_kv=shared_kv[layer.layer_type],
+            offset=offset,
+        )
+    h = drafter.model.norm(h)
+    last_hidden = drafter.post_projection(h)
+    logits = (
+        drafter._lm_head_fn(h)
+        if drafter._lm_head_fn is not None
+        else drafter.model.embed_tokens.as_linear(h)
+    )
+    return last_hidden, logits
+
+
 def _patch_vlm_language_model(g4_lang: Any) -> None:
     cls = g4_lang.LanguageModel
     if "_omlx_mtp_runtime_patched" in cls.__dict__:
@@ -244,12 +285,14 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
             raise
         self._omlx_mtp_shared_kv = sink
         self._omlx_mtp_cache_ref = cache
+        self._omlx_mtp_row_spans = None
         if batched:
             # Per-row processed lengths at capture. Every row of a stashed
             # bank ends at the same (right-aligned) slot, so a row's
             # committed span is located by comparing these with the
-            # post-rollback lengths (see _row_shared_kv).
-            self._omlx_mtp_row_offsets = _row_offsets(cache)
+            # post-rollback lengths (see _row_shared_kv). Kept lazy (the
+            # ``+ 0`` detaches from in-place trims) so capture adds no sync.
+            self._omlx_mtp_row_offsets = _row_offset_array(cache) + 0
             self._omlx_mtp_kv_offset = None
         else:
             self._omlx_mtp_row_offsets = None
@@ -270,12 +313,12 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
             return rollback_cache_transaction(caches, gdn_states, accepted, block_size)
         return original_rollback(self, caches, gdn_states, accepted, block_size)
 
-    def _row_offsets(cache) -> list[int]:
+    def _row_offset_array(cache):
         """Per-row processed token counts of a batched cache list."""
         for c in cache or []:
             offset = getattr(c, "offset", None)
             if isinstance(offset, mx.array) and offset.ndim == 1:
-                return [int(v) for v in offset.tolist()]
+                return offset
         raise RuntimeError("gemma4 batched MTP: no per-row cache offset available")
 
     def _row_shared_kv(self, row: int):
@@ -287,14 +330,34 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         The span is sliced to the row's committed tokens (bounded by the
         bank's length for the sliding window), which is exactly the compact
         layout of a singleton capture.
+
+        The first draft after the shared rollback reads every row's lengths
+        in one host sync; the other rows and chain steps reuse the spans so
+        each request's draft chain queues without waiting for the previous
+        row's GPU work.
         """
-        captured = self._omlx_mtp_row_offsets[row]
-        committed = _row_offsets(self._omlx_mtp_cache_ref)[row]
-        rejected = captured - committed
+        spans = self._omlx_mtp_row_spans
+        if spans is None:
+            captured, committed = mx.stack(
+                [
+                    self._omlx_mtp_row_offsets,
+                    _row_offset_array(self._omlx_mtp_cache_ref),
+                ]
+            ).tolist()
+            spans = self._omlx_mtp_row_spans = {
+                "captured": [int(v) for v in captured],
+                "committed": [int(v) for v in committed],
+                "banks": {},
+            }
+        banks = spans["banks"].get(row)
+        committed = spans["committed"][row]
+        if banks is not None:
+            return banks, committed
+        rejected = spans["captured"][row] - committed
         if rejected < 0:
             raise RuntimeError(
                 f"gemma4 batched MTP: row {row} grew after capture "
-                f"({captured} -> {committed})"
+                f"({spans['captured'][row]} -> {committed})"
             )
         banks = {}
         for layer_type, (keys, values) in self._omlx_mtp_shared_kv.items():
@@ -308,6 +371,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
                 keys[row : row + 1, :, start:end, :],
                 values[row : row + 1, :, start:end, :],
             )
+        spans["banks"][row] = banks
         return banks, committed
 
     def _mtp_query_position(self) -> int:
@@ -400,8 +464,9 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         # hidden's token — the last committed slot, not the next one
         # (mirrors _mtp_draft_position).
         drafter._kv_valid_len = valid_len
-        position_ids = mx.array([[max(valid_len - 1, 0)]])
-        head_hidden, logits = drafter(inputs_embeds, shared_kv, position_ids)
+        head_hidden, logits = _draft_forward(
+            drafter, inputs_embeds, shared_kv, max(valid_len - 1, 0), valid_len
+        )
         if return_hidden:
             return logits, head_hidden
         return logits

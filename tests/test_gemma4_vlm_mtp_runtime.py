@@ -166,27 +166,36 @@ def test_attach_leaves_drafter_unbound():
     assert lm.mtp._input_embed is None
 
 
-def _stubbed_mtp_lm(cache_entries):
-    """LanguageModel with an attached stub drafter and fake cache stash."""
+def _stubbed_mtp_lm(cache_entries, monkeypatch):
+    """LanguageModel with an attached stub drafter and fake cache stash.
+
+    ``drafter.forward`` records the head forward the runtime issues
+    (``_draft_forward(drafter, inputs_embeds, shared_kv, position, valid)``).
+    """
     lm_mtp.set_mtp_active(True)
     lm = _language_model(_text_config({"mtp_assistant_config": TINY_ASSISTANT_CONFIG}))
 
     drafter = MagicMock()
     drafter._input_embed = lambda ids: mx.zeros((1, 1, 24), dtype=mx.float32)
     drafter._input_embed_scale = 1.0
-    drafter.return_value = (
-        mx.zeros((1, 1, 24), dtype=mx.float32),
-        mx.zeros((1, 1, 64), dtype=mx.float32),
+    drafter.forward = MagicMock(
+        return_value=(
+            mx.zeros((1, 1, 24), dtype=mx.float32),
+            mx.zeros((1, 1, 64), dtype=mx.float32),
+        )
     )
+    monkeypatch.setattr(gemma4_vlm_runtime, "_draft_forward", drafter.forward)
     lm.mtp = drafter
     lm._omlx_mtp_cache_ref = cache_entries
     return lm, drafter
 
 
-def test_mtp_forward_position_prefers_rotating_absolute_offset():
+def test_mtp_forward_position_prefers_rotating_absolute_offset(monkeypatch):
     # BatchRotatingKVCache._offset is the absolute committed length; its
     # _idx is a ring index and must NOT be used.
-    lm, drafter = _stubbed_mtp_lm([SimpleNamespace(_offset=5, _idx=99, offset="na")])
+    lm, drafter = _stubbed_mtp_lm(
+        [SimpleNamespace(_offset=5, _idx=99, offset="na")], monkeypatch
+    )
     lm._omlx_mtp_shared_kv = {
         "full_attention": (mx.zeros((1, 1, 7, 8)), mx.zeros((1, 1, 7, 8)))
     }
@@ -197,20 +206,22 @@ def test_mtp_forward_position_prefers_rotating_absolute_offset():
     logits, head_hidden = lm.mtp_forward(hidden, ids, [], return_hidden=True)
 
     assert drafter._kv_valid_len == 5
-    inputs_embeds, shared_kv, position_ids = drafter.call_args.args
+    head, inputs_embeds, shared_kv, position, valid = drafter.forward.call_args.args
+    assert head is drafter
+    assert valid == 5
     # Only the last (hidden, token) pair is consumed; fused input is
     # [tok_embed(24), hidden(24)].
     assert inputs_embeds.shape == (1, 1, 48)
-    # Query position = last committed slot (valid_len - 1).
-    assert position_ids.tolist() == [[4]]
+    # Query position = last committed slot (valid_len - 1), a host int.
+    assert position == 4
     # Rejected tail (7 captured - 5 committed) sliced off the stash.
     assert shared_kv["full_attention"][0].shape[-2] == 5
     assert logits.shape == (1, 1, 64)
     assert head_hidden.shape == (1, 1, 24)
 
 
-def test_mtp_forward_uses_plain_int_offset_and_batch_idx():
-    lm, drafter = _stubbed_mtp_lm([SimpleNamespace(offset=6)])
+def test_mtp_forward_uses_plain_int_offset_and_batch_idx(monkeypatch):
+    lm, drafter = _stubbed_mtp_lm([SimpleNamespace(offset=6)], monkeypatch)
     lm._omlx_mtp_shared_kv = {
         "full_attention": (mx.zeros((1, 1, 6, 8)), mx.zeros((1, 1, 6, 8)))
     }
@@ -224,8 +235,8 @@ def test_mtp_forward_uses_plain_int_offset_and_batch_idx():
     assert drafter._kv_valid_len == 4
 
 
-def test_mtp_forward_rebinds_stale_input_embed():
-    lm, drafter = _stubbed_mtp_lm([SimpleNamespace(offset=3)])
+def test_mtp_forward_rebinds_stale_input_embed(monkeypatch):
+    lm, drafter = _stubbed_mtp_lm([SimpleNamespace(offset=3)], monkeypatch)
     lm._omlx_mtp_shared_kv = {
         "full_attention": (mx.zeros((1, 1, 3, 8)), mx.zeros((1, 1, 3, 8)))
     }
@@ -234,8 +245,39 @@ def test_mtp_forward_rebinds_stale_input_embed():
     drafter.bind.assert_called_once_with(lm)
 
 
-def test_mtp_forward_requires_shared_kv_stash():
-    lm, _ = _stubbed_mtp_lm([SimpleNamespace(offset=3)])
+def test_mtp_forward_requires_shared_kv_stash(monkeypatch):
+    lm, _ = _stubbed_mtp_lm([SimpleNamespace(offset=3)], monkeypatch)
     lm._omlx_mtp_shared_kv = None
     with pytest.raises(RuntimeError, match="shared K/V stash"):
         lm.mtp_forward(mx.zeros((1, 1, 24)), mx.zeros((1, 1), dtype=mx.uint32), [])
+
+
+@pytest.mark.parametrize("length", [5, 12])
+def test_draft_forward_matches_stock_head_forward(length):
+    # The host-position forward must reproduce the stock head forward, whose
+    # only difference is reading the position back from an mx.array.
+    mx.random.seed(3)
+    lm = _language_model(_text_config({"mtp_assistant_config": TINY_ASSISTANT_CONFIG}))
+    mx.eval(lm.parameters())
+    drafter = lm.mtp
+    drafter.bind(lm)
+    shared_kv = {
+        "sliding_attention": (
+            mx.random.normal((1, 2, min(length, 10), 8)),
+            mx.random.normal((1, 2, min(length, 10), 8)),
+        ),
+        "full_attention": (
+            mx.random.normal((1, 1, length, 8)),
+            mx.random.normal((1, 1, length, 8)),
+        ),
+    }
+    inputs_embeds = mx.random.normal((1, 1, 48))
+    drafter._kv_valid_len = length
+    ref_hidden, ref_logits = drafter(
+        inputs_embeds, shared_kv, mx.array([[length - 1]])
+    )
+    hidden, logits = gemma4_vlm_runtime._draft_forward(
+        drafter, inputs_embeds, shared_kv, length - 1, length
+    )
+    assert mx.allclose(hidden, ref_hidden, atol=1e-5)
+    assert mx.allclose(logits, ref_logits, atol=1e-5)
