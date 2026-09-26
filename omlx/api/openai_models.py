@@ -11,7 +11,7 @@ These models define the request and response schemas for:
 """
 
 import json
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import AliasChoices, BaseModel, Field, field_validator, model_validator
 
@@ -377,6 +377,9 @@ class ChatCompletionRequest(BaseModel):
     specprefill_threshold: Optional[int] = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # External MTP drafter assignment set by the admission controller
+    # (Krisis). None = scheduler default (MTP only when alone).
+    mtp_mode: Optional[Literal["claim", "yield", "off"]] = None
 
     @field_validator("stop", mode="before")
     @classmethod

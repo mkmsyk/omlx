@@ -43,7 +43,7 @@ from .exceptions import (
 )
 from .model_registry import get_registry
 from .output_collector import RequestOutputCollector, RequestStreamState
-from .request import Request, RequestOutput, SamplingParams
+from .request import MTP_MODES, Request, RequestOutput, SamplingParams
 from .scheduler import Scheduler, SchedulerConfig, _sync_and_clear_cache
 from .utils.fatal import (
     FATAL_TEARDOWN_TIMEOUT_S,
@@ -688,6 +688,7 @@ class EngineCore:
         benchmark_trace: bool = False,
         benchmark_ane_sequence_length: int = 0,
         tools: list[dict[str, Any]] | None = None,
+        mtp_mode: Optional[str] = None,
     ) -> str:
         """
         Add a request for processing.
@@ -704,10 +705,13 @@ class EngineCore:
             specprefill: Per-request SpecPrefill override (True/False/None)
             specprefill_keep_pct: Per-request keep rate override
             specprefill_threshold: Per-request threshold override (min tokens)
+            mtp_mode: External MTP drafter assignment (see request.MTP_MODES)
 
         Returns:
             The request ID
         """
+        if mtp_mode is not None and mtp_mode not in MTP_MODES:
+            raise ValueError(f"unknown mtp_mode: {mtp_mode!r}")
         if request_id is None:
             request_id = str(uuid.uuid4())
 
@@ -730,6 +734,7 @@ class EngineCore:
             preserve_reasoning=preserve_reasoning,
             benchmark_trace=benchmark_trace,
             benchmark_ane_sequence_length=benchmark_ane_sequence_length,
+            mtp_mode=mtp_mode,
         )
 
         # SpecPrefill: resolve per-request settings.

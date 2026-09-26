@@ -3551,6 +3551,12 @@ class EnginePool:
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
                     "prefill_eviction_eligible": self._is_idle_for_prefill_eviction(e),
+                    # Chat requests to this loaded model may carry mtp_mode
+                    # (claim / yield / off) for its external MTP drafter.
+                    "mtp_request_modes": (
+                        e.engine is not None
+                        and getattr(e.engine, "vlm_mtp_drafter", None) is not None
+                    ),
                 }
             )
         return {

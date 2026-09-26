@@ -231,6 +231,11 @@ class _VLMMTPDecodeState:
     stop_token_ids: set[int] = field(default_factory=set)
     emitted: int = 0
     finished: bool = False
+    # Caller assignment this row took the drafter under (Request.mtp_mode).
+    mtp_mode: str | None = None
+    # A text-only row can be replayed from token ids when it hands the
+    # drafter to a claimant; an image row cannot.
+    text_only: bool = False
 
 
 @dataclass
@@ -1327,6 +1332,20 @@ def _remaining_generation_tokens(request: Any) -> int:
     """Keep an API request's original generation budget after a replay."""
     emitted = len(getattr(request, "output_token_ids", []))
     return max(1, request.sampling_params.max_tokens - emitted)
+
+
+def _vlm_mtp_request_is_text_only(request: Any) -> bool:
+    """True when token ids alone reproduce the request's context.
+
+    Only such a row may be replayed into BatchGenerator when it hands the
+    drafter to a claimant; image/video embeddings are not in the token ids.
+    """
+    return (
+        not getattr(request, "images", None)
+        and not getattr(request, "videos", None)
+        and getattr(request, "vlm_image_hash", None) is None
+        and not getattr(request, "vlm_cache_key_ranges", None)
+    )
 
 
 def _cache_layer_token_count(cache_obj: Any) -> int:
@@ -9239,6 +9258,15 @@ class Scheduler:
         if drafter is None:
             return None
 
+        # Caller-assigned drafter use (Krisis MTP baton). "off" never takes
+        # MTP; "claim"/"yield" take a free drafter even beside batch peers.
+        # A "yield" holder was already handed back to BatchGenerator at the
+        # step head (_yield_vlm_mtp_to_claimant) when a claimant is present.
+        mtp_mode = getattr(request, "mtp_mode", None)
+        if mtp_mode == "off":
+            logger.debug("vlm_mtp routing skipped for %s: mtp_mode=off", request.request_id)
+            return None
+
         # Per-request logits processors that implement the snapshot/restore
         # protocol (today: ThinkingBudgetProcessor) ARE applied on this
         # path: MTPProcessingSampler threads them into mlx-vlm's verify
@@ -9278,24 +9306,28 @@ class Scheduler:
         if self._vlm_mtp_active:
             logger.info(
                 "vlm_mtp routing skipped for %s: drafter is busy with %d "
-                "request(s); falling back to BatchGenerator",
+                "request(s) (mtp_mode=%s); falling back to BatchGenerator",
                 request.request_id,
                 len(self._vlm_mtp_active),
+                mtp_mode,
             )
             return None
 
-        # Prefer ordinary batching when a peer is already ready or admitted.
-        # Starting MTP for the first request and falling its peers back creates
-        # a slower mixed decode group, while also paying this path's extra
-        # final target forward. A chunked-prefill request still appears in
-        # ``prefilling`` while it is finalized, so exclude the request itself.
+        # Without an assignment, prefer ordinary batching when a peer is
+        # already ready or admitted. Starting MTP for the first request and
+        # falling its peers back creates a mixed decode group, while also
+        # paying this path's extra final target forward. A chunked-prefill
+        # request still appears in ``prefilling`` while it is finalized, so
+        # exclude the request itself. An assigned ("claim"/"yield") request
+        # skips this gate: the controller chose it to own the drafter beside
+        # batch peers, and its rounds are emitted whole per step.
         waiting_count = len(getattr(self, "waiting", ()))
         running_count = len(getattr(self, "running", ()))
         prefilling_count = sum(
             getattr(prefill, "request_id", None) != request.request_id
             for prefill in getattr(self, "prefilling", ())
         )
-        if waiting_count or running_count or prefilling_count:
+        if mtp_mode is None and (waiting_count or running_count or prefilling_count):
             logger.info(
                 "vlm_mtp routing skipped for %s: scheduler contention "
                 "(running=%d waiting=%d prefilling=%d); falling back to "
@@ -9430,6 +9462,7 @@ class Scheduler:
                 draft_block_size=self._vlm_mtp_draft_block_size,
                 token_dtype=mx.int32,
                 eos_token_ids=eos_ids or None,
+                per_round=True,
             )
         except Exception as e:
             logger.warning(
@@ -9453,12 +9486,17 @@ class Scheduler:
             state_machine=state_machine,
             max_tokens=_remaining_generation_tokens(request),
             stop_token_ids=set(eos_ids),
+            mtp_mode=mtp_mode,
+            text_only=_vlm_mtp_request_is_text_only(request),
         )
         logger.info(
-            "vlm_mtp decode started: request=%s uid=%d block_size=%s",
+            "vlm_mtp decode started: request=%s uid=%d block_size=%s "
+            "mtp_mode=%s peers=%d",
             request.request_id,
             uid,
             self._vlm_mtp_draft_block_size,
+            mtp_mode,
+            running_count + prefilling_count,
         )
         return uid
 
@@ -9514,9 +9552,10 @@ class Scheduler:
     def _step_vlm_mtp(self) -> list[_VLMMTPResponse]:
         """Advance every active vlm_mtp generator by one yield.
 
-        Returns the synthesized responses for ``_process_batch_responses``.
-        Mirrors mlx-lm BatchGenerator's per-step contract: one
-        ``GenerationBatch.Response``-shaped object per active uid.
+        Returns the synthesized responses for ``_process_batch_responses``:
+        one ``GenerationBatch.Response``-shaped object per emitted token, so
+        a per-round yield produces several responses for the same uid in
+        order (the output collector merges them).
         """
         if not self._vlm_mtp_active:
             return []
@@ -9550,49 +9589,51 @@ class Scheduler:
                 state.finished = True
                 continue
 
-            # Single-request mode yields ints; batch mode (not yet routed
-            # by omlx) would yield a list. Guard so the path stays robust
-            # if we widen routing later.
+            # The scheduler routes single requests with per_round=True: one
+            # yield is every token a verify round committed, emitted in this
+            # step so the MTP row is not paced by batch peers at one token
+            # per step. A bare int is the one-token form.
             if isinstance(token_val, list):
-                # Take the first row (we only route singles for now).
-                tok = next((t for t in token_val if t is not None), None)
-                if tok is None:
-                    responses.append(
-                        _VLMMTPResponse(
-                            uid=uid,
-                            token=0,
-                            finish_reason="length",
-                            prompt_cache=state.prompt_cache,
-                        )
-                    )
-                    state.finished = True
-                    continue
-                token = int(tok)
+                tokens = [int(tok) for tok in token_val if tok is not None]
             else:
-                token = int(token_val)
-
-            state.emitted += 1
-            finish_reason: str | None = None
-            if state.stop_token_ids and token in state.stop_token_ids:
-                finish_reason = "stop"
-            elif state.emitted >= state.max_tokens:
-                finish_reason = "length"
-
-            if finish_reason is not None:
-                self._log_vlm_mtp_stats(state, finish_reason)
-
-            responses.append(
-                _VLMMTPResponse(
-                    uid=uid,
-                    token=token,
-                    finish_reason=finish_reason,
-                    prompt_cache=(
-                        state.prompt_cache if finish_reason is not None else None
-                    ),
+                tokens = [int(token_val)]
+            if not tokens:
+                responses.append(
+                    _VLMMTPResponse(
+                        uid=uid,
+                        token=0,
+                        finish_reason="length",
+                        prompt_cache=state.prompt_cache,
+                    )
                 )
-            )
-            if finish_reason is not None:
                 state.finished = True
+                continue
+
+            for token in tokens:
+                state.emitted += 1
+                finish_reason: str | None = None
+                if state.stop_token_ids and token in state.stop_token_ids:
+                    finish_reason = "stop"
+                elif state.emitted >= state.max_tokens:
+                    finish_reason = "length"
+
+                if finish_reason is not None:
+                    self._log_vlm_mtp_stats(state, finish_reason)
+
+                responses.append(
+                    _VLMMTPResponse(
+                        uid=uid,
+                        token=token,
+                        finish_reason=finish_reason,
+                        prompt_cache=(
+                            state.prompt_cache if finish_reason is not None else None
+                        ),
+                    )
+                )
+                if finish_reason is not None:
+                    # Tokens the round committed past a stop are dropped.
+                    state.finished = True
+                    break
 
         # Drop finished entries.
         for uid in [u for u, s in self._vlm_mtp_active.items() if s.finished]:
@@ -9969,8 +10010,29 @@ class Scheduler:
                 error_code="process_memory_retry_exhausted",
             )
 
+        self._return_running_request_to_waiting(request, front=False)
+        request.memory_pressure_retries += 1
+        logger.warning(
+            "Deferred %s to waiting tail for process-memory retry %d/%d",
+            request_id,
+            request.memory_pressure_retries,
+            self._MAX_MEMORY_PRESSURE_RETRIES,
+        )
+        return None
+
+    def _return_running_request_to_waiting(
+        self, request: "Request", *, front: bool
+    ) -> None:
+        """Move a decoding/prefilling row back to waiting without aborting it.
+
+        Its emitted token history becomes replay context, so the client
+        receives no duplicate text after the re-prefill. Stream and parser
+        state are kept. Runs only on the engine executor thread, at a step
+        boundary (a vlm_mtp row is then between verify rounds).
+        """
+        request_id = request.request_id
         # Match the regular deferred-abort ordering before shrinking a live
-        # batch row. This runs only on the engine executor thread.
+        # batch row.
         _safe_sync_stream(self._stream)
         uid = self.request_id_to_uid.pop(request_id, None)
         if uid is not None:
@@ -10012,16 +10074,58 @@ class Scheduler:
         request._model_cache_config = None
         request.batch_uid = None
         request.status = RequestStatus.WAITING
-        request.memory_pressure_retries += 1
         request._pressure_replayed = True
-        self.waiting.append(request)
-        logger.warning(
-            "Deferred %s to waiting tail for process-memory retry %d/%d",
-            request_id,
-            request.memory_pressure_retries,
-            self._MAX_MEMORY_PRESSURE_RETRIES,
+        if front:
+            self.waiting.appendleft(request)
+        else:
+            self.waiting.append(request)
+
+    def _yield_vlm_mtp_to_claimant(self) -> bool:
+        """Hand the drafter from a "yield" holder to a waiting "claim" request.
+
+        Runs once per step at the step head, where every vlm_mtp row sits
+        between verify rounds. The holder is replayed into BatchGenerator at
+        the front of the waiting queue with MTP off, so it keeps decoding
+        without MTP; the claimant then finds the drafter free when its
+        prefill finishes. A holder that cannot be replayed from token ids
+        (image rows) keeps the drafter and the claimant decodes without MTP.
+        """
+        if not self._vlm_mtp_active:
+            return False
+        claimant = next(
+            (
+                request
+                for request in (*self.waiting, *self.prefilling)
+                if getattr(request, "mtp_mode", None) == "claim"
+            ),
+            None,
         )
-        return None
+        if claimant is None:
+            return False
+        for state in list(self._vlm_mtp_active.values()):
+            if state.mtp_mode != "yield" or state.finished:
+                continue
+            holder = state.request
+            if not state.text_only:
+                logger.info(
+                    "vlm_mtp drafter kept by %s for claimant %s: holder is not "
+                    "text-only and cannot be replayed",
+                    holder.request_id,
+                    claimant.request_id,
+                )
+                return False
+            self._log_vlm_mtp_stats(state, "yielded")
+            self._return_running_request_to_waiting(holder, front=True)
+            holder.mtp_mode = "off"
+            logger.info(
+                "vlm_mtp drafter yielded: holder=%s continues without MTP after "
+                "%d tokens; claimant=%s",
+                holder.request_id,
+                len(holder.output_token_ids),
+                claimant.request_id,
+            )
+            return True
+        return False
 
     def _consume_pressure_clear(self) -> bool:
         """Retire a pending hard-pressure clear (inference-thread side).
@@ -12948,6 +13052,12 @@ class Scheduler:
             if pressure_error is not None:
                 output.outputs.append(pressure_error)
                 output.finished_request_ids.add(pressure_error.request_id)
+
+        # A caller-assigned MTP claimant takes the drafter from a "yield"
+        # holder here, at the one step boundary where every vlm_mtp row is
+        # between verify rounds.
+        if self._yield_vlm_mtp_to_claimant():
+            output.has_work = True
 
         # Drain a deferred between-turn reclaim requested by the memory
         # enforcer (only acts when the scheduler is idle).

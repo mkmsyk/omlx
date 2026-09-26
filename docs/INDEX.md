@@ -23,6 +23,7 @@
 | [oMLX upstream土台更新](internal/session-upstream-foundation-20260918.md) | upstream統合、依存更新、native kernel再ビルド、全体テスト |
 | [Gemma 4のツール前本文によるthought漏れ](internal/session-gemma4-preamble-turn-20260926.md) | tool_calls付き本文がターンを閉じ、生成が`thought`平文で始まる原因の実測と変換層での修正 |
 | [Gemma 4 Lightning MTPの複数要求対応](internal/session-gemma-batch-mtp-20260926.md) | 共有検証・行別巻き戻し・行別下書き区間の実装、回転cache取り消しと近似attention判定の潜在不具合修正 |
+| [外付けMTPの要求ごとの割当](internal/session-mtp-baton-20260927.md) | Krisis の MTP バトン用の `mtp_mode`（claim / yield / off）、1周まとめ出力、仮持ちの受け渡し |
 
 [管制管理下のprefill退避](internal/session-managed-prefill-20260910.md)。
 

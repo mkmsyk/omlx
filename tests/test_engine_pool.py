@@ -8,6 +8,7 @@ import io
 import os
 import logging
 import shutil
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2926,6 +2927,22 @@ class TestEnginePoolStatusIsLoading:
         for model in status["models"]:
             assert "is_loading" in model
             assert model["is_loading"] is False
+
+    def test_get_status_reports_mtp_request_modes_only_with_drafter(
+        self, small_mock_model_dir
+    ):
+        pool = _make_pool(ceiling=10 * 1024**3)
+        pool.discover_models(str(small_mock_model_dir))
+        pool._entries["model-a"].engine = SimpleNamespace(vlm_mtp_drafter=object())
+        pool._entries["model-b"].engine = SimpleNamespace(vlm_mtp_drafter=None)
+
+        models = {m["id"]: m for m in pool.get_status()["models"]}
+        assert models["model-a"]["mtp_request_modes"] is True
+        assert models["model-b"]["mtp_request_modes"] is False
+
+        pool._entries["model-a"].engine = None
+        models = {m["id"]: m for m in pool.get_status()["models"]}
+        assert models["model-a"]["mtp_request_modes"] is False
 
 
 class TestEnginePoolTTL:

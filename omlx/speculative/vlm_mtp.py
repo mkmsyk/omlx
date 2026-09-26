@@ -43,7 +43,23 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_vlm.speculative import common as _vlm_common  # noqa: E402, I001
 from mlx_vlm.speculative import load_drafter as _vlm_load_drafter  # noqa: E402
-from mlx_vlm.speculative.mtp import _buffer_mtp_target_cache
+from mlx_vlm.speculative.common import (  # noqa: SLF001
+    _dflash_block_total,
+    _record_speculative_round,
+    _SpeculativeSamplerRNG,
+)
+from mlx_vlm.speculative.mtp import (  # noqa: SLF001
+    _buffer_mtp_target_cache,
+    _mtp_acceptance_walk,
+    _mtp_cache_offset_max,
+    _mtp_draft_hidden,
+    _mtp_draft_kwargs,
+    _mtp_draft_position,
+    _mtp_next_block_size,
+    _mtp_verify_target,
+    _sampler_supports_positioned_target,
+    _slice_shared_kv_after_reject,
+)
 
 # The round loops dispatch their target-verify and cache-rollback forwards
 # inside ``with mx.stream(generation_stream)``, using mlx-vlm's own
@@ -252,6 +268,165 @@ def _read_model_type(drafter: nn.Module) -> Optional[str]:
     return getattr(config, "model_type", None)
 
 
+def _mtp_rounds_by_round(
+    model: nn.Module,
+    draft_model: nn.Module,
+    prompt_cache: List[Any],
+    hidden: mx.array,
+    shared_kv_states: dict,
+    *,
+    prompt_tokens: Optional[mx.array] = None,
+    first_bonus: int,
+    max_tokens: int,
+    sampler: Callable[[mx.array], mx.array],
+    draft_block_size: Optional[int] = None,
+    token_dtype: mx.Dtype = mx.int32,
+) -> Generator[List[int], None, None]:
+    """mlx-vlm ``_mtp_rounds`` that yields each verify round as one list.
+
+    The round body (draft, verify, acceptance walk, commit, next-round
+    hidden/shared-KV) is mlx-vlm's single-request loop unchanged; only the
+    emission differs. mlx-vlm yields the committed tokens one by one, and
+    the scheduler advances one yield per step, so beside a BatchGenerator
+    the MTP row could never outpace its batch peers. Keep this body in sync
+    with ``mlx_vlm.speculative.mtp._mtp_rounds``; the equivalence test in
+    tests/test_vlm_mtp.py pins the token stream against it.
+    """
+    lm = model.language_model if hasattr(model, "language_model") else model
+
+    block_total = _dflash_block_total(draft_model, draft_block_size)
+    configured_block_total = int(
+        getattr(draft_model.config, "block_size", block_total)
+    )
+    draft_model.reset(model)
+    sampler_rng = _SpeculativeSamplerRNG(
+        draft_model,
+        enabled=not _sampler_supports_positioned_target(sampler),
+    )
+
+    prefill_draft = getattr(draft_model, "prefill_from_target_hidden", None)
+    if callable(prefill_draft) and prompt_tokens is not None:
+        sampler_rng.draft_call(
+            prefill_draft,
+            prompt_tokens,
+            hidden,
+            first_bonus,
+            sampler,
+            token_dtype,
+            **_mtp_draft_kwargs(draft_model, False, sampler),
+        )
+
+    if hidden.shape[1] > 1:
+        hidden = hidden[:, -1:, :]
+    hidden = _mtp_draft_hidden(lm, hidden)
+
+    kv_offset = _mtp_cache_offset_max(prompt_cache)
+    draft_model.set_shared_kv(
+        shared_kv_states,
+        kv_offset,
+        position=_mtp_draft_position(kv_offset),
+        kv_valid_len=kv_offset,
+    )
+
+    b = first_bonus
+    emitted = 1  # caller already yielded the first bonus
+
+    while emitted < max_tokens:
+        bs = _mtp_next_block_size(
+            draft_model,
+            block_total,
+            configured_block_total,
+            max_tokens - emitted + 1,
+        )
+        if bs <= 1:
+            break
+
+        verify = None
+        try:
+            draft_tokens = sampler_rng.draft_tokens(
+                draft_model.draft_block,
+                b,
+                hidden,
+                None,
+                bs,
+                sampler,
+                token_dtype,
+                **_mtp_draft_kwargs(draft_model, False, sampler),
+            )
+
+            with mx.stream(_vlm_generation_stream):
+                verify_input = mx.concatenate(
+                    [mx.array([[b]], dtype=token_dtype), draft_tokens], axis=1
+                )
+                verify = _mtp_verify_target(
+                    lm,
+                    verify_input,
+                    prompt_cache,
+                    sampler,
+                    sample_target_tokens=False,
+                )
+            accepted, new_tokens = _mtp_acceptance_walk(
+                lm,
+                verify,
+                draft_tokens,
+                sampler,
+                max_tokens - emitted,
+                row_id=0,
+                base_position=emitted,
+            )
+            sampler_rng.target_sampled(
+                sync_draft=not _sampler_supports_positioned_target(sampler)
+            )
+            _record_speculative_round(draft_model, accepted, bs - 1)
+
+            accept_verified = getattr(draft_model, "accept_verified_tokens", None)
+            if callable(accept_verified):
+                sampler_rng.draft_call(
+                    accept_verified,
+                    verify.hidden,
+                    draft_tokens,
+                    accepted,
+                    new_tokens,
+                    sampler,
+                    token_dtype,
+                    **_mtp_draft_kwargs(draft_model, False, sampler),
+                )
+
+            verify.commit(lm, prompt_cache, accepted, bs)
+        except BaseException:
+            if verify is not None:
+                verify.abort()
+            abort_draft = getattr(draft_model, "abort_draft_round", None)
+            if callable(abort_draft):
+                abort_draft()
+            raise
+
+        round_tokens = [int(tok) for tok in new_tokens][: max_tokens - emitted]
+        emitted += len(round_tokens)
+        yield round_tokens
+        if emitted >= max_tokens:
+            return
+
+        hidden = _mtp_draft_hidden(lm, verify.hidden[:, accepted : accepted + 1, :])
+        b = new_tokens[-1] if new_tokens else b
+
+        next_shared_kv = _slice_shared_kv_after_reject(
+            verify.shared_kv_states, bs - (accepted + 1)
+        )
+        kv_offset += accepted + 1
+        draft_model.set_shared_kv(
+            next_shared_kv,
+            kv_offset,
+            position=_mtp_draft_position(kv_offset),
+            kv_valid_len=kv_offset,
+        )
+
+        # mlx-vlm clears every 256 emitted tokens; a round can step over the
+        # exact multiple, so clear when it crosses one.
+        if emitted // 256 != (emitted - len(round_tokens)) // 256:
+            mx.clear_cache()
+
+
 def run_vlm_mtp_decode(
     *,
     target_language_model: nn.Module,
@@ -267,6 +442,7 @@ def run_vlm_mtp_decode(
     token_dtype: mx.Dtype = mx.int32,
     eos_token_ids: Optional[Set[int]] = None,
     stop_check: Optional[Callable[[int, int], bool]] = None,
+    per_round: bool = False,
 ) -> Generator[Union[int, List[Optional[int]]], None, None]:
     """Stream decoded tokens via mlx-vlm's MTP rounds.
 
@@ -274,6 +450,11 @@ def run_vlm_mtp_decode(
     ``int`` or a B=1 ``mx.array``), or ``List[Optional[int]]`` rows for
     batched decode (B > 1 ``mx.array``). ``None`` slots in the batched
     form mark rows that have finished.
+
+    With ``per_round=True`` single-request decode yields one ``List[int]``
+    per verify round instead (all tokens the round committed), so a
+    scheduler step that also drives a BatchGenerator can emit the whole
+    round rather than one token per step.
 
     The wrapper yields ``first_bonus`` as its first value: mlx-vlm's
     ``_mtp_rounds`` / ``_mtp_rounds_batch`` expect the caller to have
@@ -288,6 +469,8 @@ def run_vlm_mtp_decode(
         drafter_model = _MTPResetBindingProxy(drafter.model, target_for_rounds)
 
     is_batch = isinstance(first_bonus, mx.array) and first_bonus.size > 1
+    if is_batch and per_round:
+        raise ValueError("per_round is only defined for single-request decode")
 
     if is_batch:
         first_bonus_list = first_bonus.tolist()  # forces eval once
@@ -328,9 +511,27 @@ def run_vlm_mtp_decode(
     else:
         first_bonus_int = int(first_bonus)
 
-    yield first_bonus_int
+    yield [first_bonus_int] if per_round else first_bonus_int
 
     _buffer_mtp_target_cache(prompt_cache, drafter_model, draft_block_size)
+    if per_round:
+        for round_tokens in _mtp_rounds_by_round(
+            target_for_rounds,
+            drafter_model,
+            prompt_cache,
+            hidden,
+            shared_kv_states,
+            prompt_tokens=prompt_tokens,
+            first_bonus=first_bonus_int,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            draft_block_size=draft_block_size,
+            token_dtype=token_dtype,
+        ):
+            _sync_and_clear_cache(_vlm_generation_stream)
+            yield round_tokens
+        return
+
     for tok, _ in _mtp_rounds(
         target_for_rounds,
         drafter_model,

@@ -15,6 +15,9 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 if TYPE_CHECKING:
     from .cache.paged_cache import BlockTable
 
+# Closed vocabulary of Request.mtp_mode (None = scheduler default).
+MTP_MODES = frozenset({"claim", "yield", "off"})
+
 
 class RequestStatus(enum.IntEnum):
     """Status of a request in the scheduling system."""
@@ -231,6 +234,13 @@ class Request:
     )
     # Process-wide pressure retry after this request has joined a decode batch.
     memory_pressure_retries: int = 0
+
+    # External MTP drafter assignment requested by the caller (Krisis).
+    # None keeps the scheduler's own choice (MTP only when the request is
+    # alone). "claim" takes the drafter even beside batch peers and may take
+    # it from a "yield" holder; "yield" takes a free drafter beside peers but
+    # hands it to a claimant; "off" never uses MTP. See MTP_MODES.
+    mtp_mode: Optional[str] = None
 
     # Request-scoped tool schemas used by protocol output parsers.
     tools: list[dict[str, Any]] | None = None

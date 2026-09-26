@@ -3882,6 +3882,16 @@ class VLMBatchedEngine(BaseEngine):
                 specprefill_kwargs[key] = kwargs.pop(key)
         return specprefill_kwargs
 
+    @staticmethod
+    def _pop_mtp_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+        """Pop the per-request external-MTP assignment out of ``kwargs``.
+
+        Only this engine owns an external MTP drafter, so only it forwards
+        ``mtp_mode`` to ``add_request`` (validated there against MTP_MODES).
+        """
+        mtp_mode = kwargs.pop("mtp_mode", None)
+        return {} if mtp_mode is None else {"mtp_mode": mtp_mode}
+
     def _inject_specprefill_system_end(
         self,
         messages: list[dict[str, Any]],
@@ -4007,6 +4017,7 @@ class VLMBatchedEngine(BaseEngine):
         # SpecPrefill: forward per-request overrides to the engine, mirroring
         # stream_generate so the non-streaming path is not silently ignored.
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        mtp_kwargs = self._pop_mtp_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
 
         output = await self._engine.generate(
@@ -4020,6 +4031,7 @@ class VLMBatchedEngine(BaseEngine):
             tools=tools,
             preserve_reasoning=bool(kwargs.get("preserve_reasoning", False)),
             **specprefill_kwargs,
+            **mtp_kwargs,
         )
 
         text = clean_special_tokens(output.output_text)
@@ -4120,6 +4132,7 @@ class VLMBatchedEngine(BaseEngine):
 
         # SpecPrefill: pass per-request overrides
         specprefill_kwargs = self._pop_specprefill_kwargs(kwargs)
+        mtp_kwargs = self._pop_mtp_kwargs(kwargs)
         tools = kwargs.pop("tools", None)
 
         engine = self._engine
@@ -4139,6 +4152,7 @@ class VLMBatchedEngine(BaseEngine):
             ),
             tools=tools,
             **specprefill_kwargs,
+            **mtp_kwargs,
         )
 
         finished_normally = False

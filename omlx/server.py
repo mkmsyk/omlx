@@ -4261,6 +4261,16 @@ async def create_chat_completion(
         elif _server_state.settings_manager and ms.specprefill_threshold is not None:
             chat_kwargs["specprefill_threshold"] = ms.specprefill_threshold
 
+        # External MTP drafter assignment. Only an engine with an attached
+        # drafter can honour it; refuse instead of silently ignoring it.
+        if request.mtp_mode is not None:
+            if getattr(engine, "vlm_mtp_drafter", None) is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="mtp_mode requires a model with an external MTP drafter",
+                )
+            chat_kwargs["mtp_mode"] = request.mtp_mode
+
         if request.stop:
             chat_kwargs["stop"] = request.stop
 
