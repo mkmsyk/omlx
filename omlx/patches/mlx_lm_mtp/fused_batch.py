@@ -143,7 +143,10 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
     use_head_batch = cache is not None and batched_head.eligible(batch, rows)
     if not use_head_batch:
         batched_head.flush(batch_state)
-    draft_jobs = [] if use_head_batch else None
+    # Stateless heads (Gemma 4 assistant) draft all rows in one call per
+    # chain step against the shared capture.
+    use_rows_draft = not use_head_batch and batched_head.stateless_eligible(batch, rows)
+    draft_jobs = [] if (use_head_batch or use_rows_draft) else None
     if len(rows) == 1:
         index, row, state = rows[0]
         bg._set_singleton_mrope_delta(row)
@@ -273,7 +276,10 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         if whole_batch:
             batch.prompt_cache = cache
     if draft_jobs is not None:
-        batched_head.draft(batch, draft_jobs)
+        if use_rows_draft:
+            batched_head.draft_stateless(batch, draft_jobs)
+        else:
+            batched_head.draft(batch, draft_jobs)
     _set_draft_row(batch.model, None)
     bg._clear_rollback(cache)
     return vector_rollback and whole_batch and not replacements

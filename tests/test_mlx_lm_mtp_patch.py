@@ -4102,8 +4102,18 @@ def test_multi_request_mtp_or_singleton_only_matches_standard(
             return batch_next(batch, state)
 
         monkeypatch.setattr(bg, "_mtp_batch_next", traced_batch)
+        rows_drafts = []
+        stateless = batched_head.draft_stateless
+
+        def traced_stateless(batch, jobs):
+            rows_drafts.append(len(jobs))
+            return stateless(batch, jobs)
+
+        monkeypatch.setattr(batched_head, "draft_stateless", traced_stateless)
         actual, _ = generate(model, prompts, limits, late_join=late_join)
         assert actual == expected
+        if family == "gemma" and not unequal_depths:
+            assert rows_drafts, "Gemma rows must draft together after a shared verify"
         if not batch_supported:
             assert not batch_calls
             assert not shared_shapes
@@ -4185,6 +4195,29 @@ def test_gemma_batched_draft_rows_match_singleton_drafts(accepted, monkeypatch):
         for row, m in enumerate(accepted):
             fused_batch._set_draft_row(model, row)
             batched.append(draft(hidden[row : row + 1, m : m + 1], blocks[row][m]))
+        fused_batch._set_draft_row(model, None)
+
+        # One head call for every row reproduces the per-row drafts,
+        # including a chained second step on the head's own hidden.
+        rows_hidden = mx.concatenate(
+            [hidden[row : row + 1, m : m + 1] for row, m in enumerate(accepted)]
+        )
+        rows_ids = mx.array(
+            [[blocks[row][m]] for row, m in enumerate(accepted)], dtype=mx.uint32
+        )
+        rows_logits, rows_head = host.mtp_forward_rows(
+            rows_hidden, rows_ids, list(range(len(accepted)))
+        )
+        for row in range(len(accepted)):
+            assert mx.allclose(rows_logits[row : row + 1], batched[row], atol=1e-3, rtol=1e-3), row
+        step_ids = mx.array([[5], [9]], dtype=mx.uint32)
+        chained, _ = host.mtp_forward_rows(rows_head, step_ids, [0, 1])
+        for row in range(len(accepted)):
+            fused_batch._set_draft_row(model, row)
+            single_step = model.mtp_forward(
+                rows_head[row : row + 1], step_ids[row : row + 1], []
+            )
+            assert mx.allclose(chained[row : row + 1], single_step, atol=1e-3, rtol=1e-3), row
         fused_batch._set_draft_row(model, None)
 
         for row, m in enumerate(accepted):

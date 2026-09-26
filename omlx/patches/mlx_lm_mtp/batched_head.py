@@ -178,3 +178,84 @@ def draft(batch, jobs):
         state.stats.mtp_head_ms += elapsed
         # The authoritative cache is owner.head until flush restores rows.
         state.mtp_cache = None
+
+
+def _rows_host(model):
+    for host in (model, getattr(model, "_language_model", None), getattr(model, "language_model", None)):
+        if host is not None and callable(getattr(host, "mtp_forward_rows", None)):
+            return host
+    return None
+
+
+def stateless_eligible(batch, rows):
+    """Heads without a cache (Gemma 4 assistant) that can draft all rows at once."""
+    if len(rows) < 2 or _rows_host(batch.model) is None:
+        return False
+    states = [state for _, _, state in rows]
+    depth = states[0].depth
+    return all(
+        state.chain
+        and state.controller is None
+        and state.depth == depth
+        and not state.mtp_cache
+        and not state.head_clone
+        and bg._proc_list(row) is None
+        for _, row, state in rows
+    )
+
+
+def draft_stateless(batch, jobs):
+    """Draft the next chain for every shared-verify row with one head call per step.
+
+    ``jobs`` arrive in verify-row order (``(row, state, hidden_rows,
+    committed, prev_buf)`` from ``_run_verify_cycle_chain``). The per-row
+    path (``_chain_next_drafts``) calls the head ``rows x depth`` times and
+    builds each call's graph on the host while the GPU waits; here each chain
+    step is one call over all rows, with the same inputs, positions and
+    sampling as the per-row path.
+    """
+    host = _rows_host(batch.model)
+    states = [job[1] for job in jobs]
+    depth = states[0].depth
+    if depth == 0:
+        # Mirrors _chain_next_drafts for a stateless head at depth 0.
+        for state in states:
+            state.drafts = mx.zeros((0,), dtype=mx.uint32)
+            state.draft_lps = []
+            state.draft_accept_lps = []
+        return
+    started = time.perf_counter()
+    hidden = mx.concatenate([job[2][:, -1:, :] for job in jobs])
+    head_prenorm = getattr(host, "_omlx_mtp_head_prenorm", False)
+    if bg._HEAD_HIDDEN_POST_NORM and not head_prenorm:
+        hidden = bg._trunk_norm_module(batch.model)(hidden)
+    tokens = mx.stack([job[3][-1:] for job in jobs])
+    rows = list(range(len(jobs)))
+    logits, head_hidden = host.mtp_forward_rows(hidden, tokens, rows)
+    samplers = [bg._resolve_draft_sampler(row, state) for row, state, *_ in jobs]
+    greedy = all(bg._is_greedy(row) for row, *_ in jobs)
+    drafted, probabilities, acceptance = [], [], []
+    for index in range(depth):
+        lp = bg._logprobs(logits[:, -1, :])
+        if greedy:
+            token = mx.argmax(lp, axis=-1).astype(mx.uint32)
+            accept_lp = lp
+        else:
+            token, accept_lp = _sample_rows(samplers, lp)
+            token = token.astype(mx.uint32)
+        drafted.append(token)
+        probabilities.append(lp)
+        acceptance.append(accept_lp)
+        if index + 1 < depth:
+            logits, head_hidden = host.mtp_forward_rows(
+                head_hidden[:, -1:], token[:, None], rows
+            )
+    result = mx.stack(drafted, axis=1)
+    mx.async_eval(result)
+    elapsed = (time.perf_counter() - started) * 1000 / len(states)
+    for index, (job, state) in enumerate(zip(jobs, states)):
+        state.hist_offset += int(job[3].shape[0])
+        state.drafts = result[index]
+        state.draft_lps = [lp[index] for lp in probabilities]
+        state.draft_accept_lps = [lp[index] for lp in acceptance]
+        state.stats.mtp_head_ms += elapsed

@@ -277,6 +277,71 @@ def _draft_forward(drafter: Any, inputs_embeds, shared_kv, position: int, kv_val
     return last_hidden, logits
 
 
+def _draft_rows_context(drafter: Any, banks_by_row: list, committed: list[int]):
+    """Padded shared K/V, masks and RoPE offsets for drafting several rows.
+
+    Each row's span is the compact singleton layout (``_row_shared_kv``):
+    the full-attention bank holds exactly the row's committed tokens and the
+    sliding bank its last window. Rows are right-padded to a common length
+    and masked so every row attends to the same keys, at the same local
+    query position, as its singleton draft (``make_drafter_masks`` with
+    ``_local_window_offset``).
+    """
+    from mlx_vlm.speculative.drafters.gemma4_assistant.masks import (
+        bidirectional_full_mask,
+        bidirectional_swa_mask,
+    )
+
+    window = drafter.config.text_config.sliding_window
+    padded, masks = {}, {}
+    for layer_type in banks_by_row[0]:
+        lengths = [int(b[layer_type][0].shape[-2]) for b in banks_by_row]
+        width = max(lengths)
+
+        def pad(x, n):
+            return x if n == width else mx.pad(x, [(0, 0), (0, 0), (0, width - n), (0, 0)])
+
+        keys = mx.concatenate([pad(b[layer_type][0], n) for b, n in zip(banks_by_row, lengths)])
+        values = mx.concatenate([pad(b[layer_type][1], n) for b, n in zip(banks_by_row, lengths)])
+        padded[layer_type] = (keys, values)
+        valid = mx.array(lengths, dtype=mx.int32)
+        dtype = keys.dtype
+        if layer_type == "sliding_attention":
+            query = mx.array(
+                [min(c - 1, n) for c, n in zip(committed, lengths)], dtype=mx.int32
+            )
+            masks[layer_type] = bidirectional_swa_mask(
+                1, query, width, window, valid, 0, dtype
+            )
+        else:
+            masks[layer_type] = bidirectional_full_mask(1, width, valid, 0, dtype)
+    offset = mx.array([max(c - 1, 0) for c in committed], dtype=mx.int32)
+    return padded, masks, offset
+
+
+def _draft_forward_rows(drafter: Any, inputs_embeds, context):
+    """``_draft_forward`` for B rows sharing one padded draft context."""
+    shared_kv, masks, offset = context
+    h = drafter.pre_projection(inputs_embeds)
+    for layer in drafter.model.layers:
+        h, _, _ = layer(
+            h,
+            mask=masks[layer.layer_type],
+            cache=None,
+            per_layer_input=None,
+            shared_kv=shared_kv[layer.layer_type],
+            offset=offset,
+        )
+    h = drafter.model.norm(h)
+    last_hidden = drafter.post_projection(h)
+    logits = (
+        drafter._lm_head_fn(h)
+        if drafter._lm_head_fn is not None
+        else drafter.model.embed_tokens.as_linear(h)
+    )
+    return last_hidden, logits
+
+
 def _patch_vlm_language_model(g4_lang: Any) -> None:
     cls = g4_lang.LanguageModel
     if "_omlx_mtp_runtime_patched" in cls.__dict__:
@@ -553,6 +618,44 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
             return logits, head_hidden
         return logits
 
+    def mtp_forward_rows(self, hidden_states, next_token_ids, rows):
+        """Draft one chain step for several rows of a batched verify capture.
+
+        ``hidden_states`` / ``next_token_ids`` carry one row per entry of
+        ``rows`` (verify-batch row indices). Each row drafts against its own
+        committed span exactly as ``mtp_forward`` would, but the head runs
+        once for all rows. The padded context is built on the first call of
+        a cycle and reused by the chain steps.
+        """
+        if getattr(self, "_omlx_mtp_row_offsets", None) is None:
+            raise RuntimeError("gemma4 mtp_forward_rows needs a batched verify capture")
+        drafter = self.mtp
+        if drafter._input_embed is not self.model.embed_tokens:
+            drafter.bind(self)
+        h = hidden_states[:, -1:, :]
+        want_dtype = str(h.dtype)
+        if getattr(drafter, "_omlx_head_dtype", None) != want_dtype:
+            _align_drafter_dtype(drafter, h.dtype)
+            drafter._omlx_head_dtype = want_dtype
+        ids = next_token_ids[:, -1:]
+        tok_embed = drafter._input_embed(ids) * drafter._input_embed_scale
+        inputs_embeds = mx.concatenate([tok_embed.astype(h.dtype), h], axis=-1)
+
+        key = tuple(int(r) for r in rows)
+        spans_ctx = None
+        if self._omlx_mtp_row_spans is not None:
+            spans_ctx = self._omlx_mtp_row_spans.get("rows_ctx")
+        if spans_ctx is None or spans_ctx[0] != key:
+            banks, committed = [], []
+            for row in key:
+                bank, valid = _row_shared_kv(self, row)
+                banks.append(bank)
+                committed.append(valid)
+            spans_ctx = (key, _draft_rows_context(drafter, banks, committed))
+            self._omlx_mtp_row_spans["rows_ctx"] = spans_ctx
+        head_hidden, logits = _draft_forward_rows(drafter, inputs_embeds, spans_ctx[1])
+        return logits, head_hidden
+
     def make_mtp_cache(self):
         """The assistant head keeps no state — nothing to clone or trim."""
         return []
@@ -561,6 +664,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
     cls.__call__ = __call__
     cls.rollback_speculative_cache = rollback_speculative_cache
     cls.mtp_forward = mtp_forward
+    cls.mtp_forward_rows = mtp_forward_rows
     cls.make_mtp_cache = make_mtp_cache
     # Shared verification: rows keep request-local acceptance and draft
     # context; the verify transaction commits ragged accepts per row.
