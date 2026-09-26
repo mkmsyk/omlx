@@ -1460,7 +1460,12 @@ def _accept_lp_for(sampler, lp):
     """
     import mlx.core as mx
 
-    from omlx.utils.sampling import apply_min_p, apply_top_k, apply_top_p
+    from omlx.utils.sampling import (
+        apply_min_p,
+        apply_top_k,
+        apply_top_p,
+        apply_top_p_then_top_k,
+    )
 
     temp = float(getattr(sampler, "temp", 0.0) or 0.0)
     if temp == 0.0:
@@ -1469,15 +1474,20 @@ def _accept_lp_for(sampler, lp):
 
     out = lp
     top_p = float(getattr(sampler, "top_p", 0.0) or 0.0)
-    if 0.0 < top_p < 1.0:
-        out = apply_top_p(out, top_p)
     min_p = float(getattr(sampler, "min_p", 0.0) or 0.0)
-    if min_p != 0.0:
-        min_keep = int(getattr(sampler, "min_tokens_to_keep", 1) or 1)
-        out = apply_min_p(out, min_p, min_keep)
     top_k = int(getattr(sampler, "top_k", 0) or 0)
-    if top_k > 0:
-        out = apply_top_k(out, top_k)
+    if 0.0 < top_p < 1.0 and top_k > 0 and min_p == 0.0:
+        # Same fused filter as make_sampler, so the draft and acceptance
+        # densities keep exactly the same token set.
+        out = apply_top_p_then_top_k(out, top_p, top_k)
+    else:
+        if 0.0 < top_p < 1.0:
+            out = apply_top_p(out, top_p)
+        if min_p != 0.0:
+            min_keep = int(getattr(sampler, "min_tokens_to_keep", 1) or 1)
+            out = apply_min_p(out, min_p, min_keep)
+        if top_k > 0:
+            out = apply_top_k(out, top_k)
 
     # Temperature scale + renormalize so the output is a proper logprob
     # distribution that can be indexed by token id for the acceptance check.

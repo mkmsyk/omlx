@@ -123,6 +123,34 @@ def apply_xtc(
     )
 
 
+def apply_top_p_then_top_k(logprobs: mx.array, top_p: float, top_k: int) -> mx.array:
+    """``apply_top_k(apply_top_p(x, top_p), top_k)`` without a full-vocab sort.
+
+    The nucleus keeps a token when the probability mass of strictly more
+    likely tokens is below ``top_p``; the survivors are the most likely
+    tokens, so top-k of them is decided inside the ``top_k`` most likely
+    tokens alone. Sorting those instead of the whole vocabulary (262144 for
+    Gemma 4) gives the same kept set, up to ties at the boundary.
+    """
+    vocab_size = logprobs.shape[-1]
+    if not isinstance(top_k, int) or not (0 < top_k < vocab_size):
+        raise ValueError(
+            f"`top_k` has to be an integer in the (0, {vocab_size}] interval,"
+            f" but is {top_k}."
+        )
+    top_idx = mx.argpartition(-logprobs, kth=top_k - 1, axis=-1)[..., :top_k]
+    top_lp = mx.take_along_axis(logprobs, top_idx, axis=-1)
+    order = mx.argsort(-top_lp, axis=-1)
+    sorted_idx = mx.take_along_axis(top_idx, order, axis=-1)
+    sorted_lp = mx.take_along_axis(top_lp, order, axis=-1)
+    probs = mx.exp(sorted_lp.astype(mx.float32))
+    higher_mass = mx.cumsum(probs, axis=-1) - probs
+    keep = higher_mass < top_p
+    kept_lp = mx.where(keep, sorted_lp, mx.array(-float("inf"), logprobs.dtype))
+    out = mx.full(logprobs.shape, -float("inf"), dtype=logprobs.dtype)
+    return mx.put_along_axis(out, sorted_idx, kept_lp, axis=-1)
+
+
 def categorical_sampling(logits: mx.array, temp: float) -> mx.array:
     """Sample a token id from the categorical distribution defined by
     ``logits / temp``. RNG state is advanced through ``mx.random.categorical``."""
@@ -146,6 +174,14 @@ def make_sampler(
     """
     if temp == 0:
         sampler = lambda x: mx.argmax(x, axis=-1)
+    elif 0 < top_p < 1.0 and top_k > 0 and min_p == 0.0 and xtc_probability <= 0.0:
+        # Same kept set as top_p followed by top_k, sorted inside top_k only.
+        sampling_methods = [lambda x: apply_top_p_then_top_k(x, top_p, top_k)]
+
+        def sampler(logprobs: mx.array) -> mx.array:
+            for method in sampling_methods:
+                logprobs = method(logprobs)
+            return categorical_sampling(logprobs, temp)
     else:
         sampling_methods = []
         if top_p > 0 and top_p < 1.0:
