@@ -199,6 +199,7 @@ from .exceptions import (
     ModelUnavailableError,
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
+    RequestOutputError,
     SchedulerQueueFullError,
 )
 from .model_settings import forced_ct_keys, merge_chat_template_request_kwargs
@@ -1025,7 +1026,24 @@ def _streaming_error_payload(e: Exception, context: str) -> dict:
         logger.warning(f"{context} prefill rejected: {e}")
         return _prefill_memory_openai_error_body(e)
     logger.error(f"Error during {context}: {e}")
-    return {"error": {"message": str(e), "type": "server_error"}}
+    return _server_error_body(e)
+
+
+def _server_error_body(e: Exception) -> dict:
+    """Generic SSE error body that keeps a scheduler ``error_code`` typed.
+
+    Clients classify ``code``/``omlx_code`` instead of parsing the English
+    message (e.g. ``memory_admission_stalled`` with ``reason`` =
+    ``admission_paused``).
+    """
+    error = {"message": str(e), "type": "server_error"}
+    if isinstance(e, RequestOutputError) and e.code:
+        error["code"] = e.code
+        error["omlx_code"] = e.code
+        reason = e.metadata.get("reason")
+        if reason is not None:
+            error["reason"] = str(reason)
+    return {"error": error}
 
 
 def _prefill_memory_openai_error_body(
@@ -2607,9 +2625,7 @@ async def _with_sse_keepalive(
                         error_data = _prefill_memory_openai_error_body(e)
                     else:
                         logger.error(f"SSE generator error: {e}")
-                        error_data = {
-                            "error": {"message": str(e), "type": "server_error"}
-                        }
+                        error_data = _server_error_body(e)
                     yield f"data: {json.dumps(error_data)}\n\n"
                     yield "data: [DONE]\n\n"
                     return

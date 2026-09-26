@@ -39,6 +39,7 @@ import mlx.core as mx
 from .exceptions import (
     PrefillMemoryAbortedError,
     PrefillMemoryExceededError,
+    RequestOutputError,
     describe_ceiling_binding,
 )
 from .model_registry import get_registry
@@ -185,7 +186,12 @@ def _raise_request_output_error(output: RequestOutput) -> None:
             ),
             limit_bytes=int(limit_bytes) if limit_bytes is not None else None,
         )
-    raise RuntimeError(output.error)
+    raise RequestOutputError(
+        output.error,
+        code=output.error_code,
+        request_id=output.request_id,
+        metadata=output.error_metadata,
+    )
 
 
 _global_mlx_executor: concurrent.futures.ThreadPoolExecutor | None = None
