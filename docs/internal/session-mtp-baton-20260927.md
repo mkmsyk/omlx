@@ -39,7 +39,16 @@ Krisis が開始時に「誰がMTPを持つか」を決め、oMLX がそれを�
   `test_glm_moe_dsa_patch.py`（2件）、`test_hf_downloader.py`（1件）で、変更を stash した基底 commit でも
   同じ8件が失敗する（開発 venv の native kernel・環境変数の状態による既存の不一致）。
 
+## 配備と本番での結果
+
+- release `0.7.0.dev4-38f9e3c` として配備（prepare の全試験合格、apply 中断0件、finalize 済み）。
+- 本番で Krisis のバトンを12分有効にしたところ、`claim` の要求が通常バッチ2件の横で MTP を始めた後、
+  26B の3件すべてが毎秒約1.2トークンへ落ち、26B の生成量は無効時の約5分の1、31B も約4割減った
+  （Krisis `docs/internal/session-mtp-baton-20260927.md`）。バトンは無効に戻した。`mtp_mode` 無指定の
+  既定動作（単独のときだけMTP）は変わらない。
+
 ## 残作業
 
-- 正式配備（Krisis `tools/omlx-update.mjs prepare --current`）。
-- GPU専有での混在速度の実測（記事MTP＋翻訳2件 と 通常3件）。結果で Krisis 側に進むかを決める。
+- 混在時の低下要因の切り分け。仮説（未検証）: `run_vlm_mtp_decode` が周回ごとに呼ぶ
+  `_sync_and_clear_cache` がプロセス全体のMetalバッファ再利用領域を毎stepで空にし、同居する通常バッチと
+  他モデルのengineにも再確保と同期待ちを課している。周回ごとの解放を間引いた版で短時間の再計測をする。
