@@ -25,19 +25,30 @@ Gemma 4テンプレート（mlx-community同梱版、Google公式2026-07-09版�
 
 ## 変更
 
-`omlx/adapter/gemma4.py`の`extract_gemma4_messages`で、tool_callsに空白以外の本文が付くとき、本文を直前の
-assistant messageとして分け、tool-calling messageの本文を空にする。本文は削らず、呼び出し前という時系列も保つ。
-tool-calling messageは本文を持たないので、テンプレートはターンを開いたまま生成へ渡す。
-出力側の文字列除去（`thought`を消す等）は加えていない。
+`omlx/adapter/gemma4.py`の`extract_gemma4_messages`で、tool_callsを持つassistantの本文（呼び出し前の前置き文）を
+プロンプトへ描画しない。テンプレートには発話の途中へ本文を置く場所が無い。
+ツール応答の後ろへ置くと発話が閉じ、独立した本文だけのmessageにしても、それ自体が`<turn|>`で閉じる。
+そのため、後続のtool呼出しは`<|turn>model`無しで閉じた発話の外へ連結される。
+前置き文を外すと、履歴の途中も末尾も`<|turn>model\n<|tool_call>…<tool_response|>`の正規形になる。
+出力側の文字列除去（`thought`を消す等）は加えていない。ツール後の最終回答（tool_callsを持たない本文）はそのまま残る。
+
+初版（2a5baa8c）は前置き文を直前のassistant messageへ分けていた。末尾の漏れは消えたが、上記の理由で履歴途中が崩れる。
+Sidekicks側の同時調査で、実経路でも外す形が良いと実測されたので置き換えた。
 
 ## 検証
 
-- 実会話の失敗ターン（prefix 6）を生補完で各4回: 修正前は4/4が`thought\n`平文で開始、
-  分割後は4/4が正規の`<|channel>thought\n<channel|>`（パーサ出力`<think>\n</think>`）で開始。
-  本文を捨てる案も漏れは消えたが、自分の前置きを見失い「承知いたしました」を繰り返したため不採用。
-- テスト: `tests/test_gemma4_messages.py`へ分割・複数ステップ順序・空白本文の3件、
-  `tests/test_gemma4_rendering.py`へ末尾ターンが開いたままかの描画検査を追加。修正を外すと3件が失敗する。
-  描画検査は`OMLX_GEMMA4_MODEL_PATH=<snapshot>`で実モデルのテンプレートを指定して実行した。
+- 実会話の失敗ターン（prefix 4・6）を`/v1/completions`へ各4回送った。
+  - 修正前は、prefix 6で4/4が`thought\n`平文で開始した。
+  - 前置き文を外す形は、prefix 4・6とも4/4が正規の`<|channel>thought\n<channel|>`（パーサ出力`<think>\n</think>`）で開始した。
+  - この生補完では、外す形で前置き（「承知いたしました」）を書き直す出力が見られた。
+- Sidekicks側の調査（Sidekicks `docs/sidekicks/sidekicks-chat-format.walkthrough.md`）の結果。
+  - 対象は事故時の履歴で、Krisis通常経路から各8回送った。
+  - 前置き文ありは、正しいtool呼出し5/8・thought漏れ4/8・退化ループ1/8だった。
+  - 外した形は8/8・0・0で、反復は0/8だった。
+- テスト（修正を外すと3件が失敗する）:
+  - `tests/test_gemma4_messages.py`へ、前置き文の除外・複数ステップ・最終回答の保持の3件を追加した。
+  - `tests/test_gemma4_rendering.py`へ、2ステップの履歴で最後のmodel発話が閉じずtool呼出しを2件含むかの描画検査を追加した。
+  - 描画検査は、`OMLX_GEMMA4_MODEL_PATH=<snapshot>`で実モデルのテンプレートを指定して実行した。
 
 ## 残TODO
 

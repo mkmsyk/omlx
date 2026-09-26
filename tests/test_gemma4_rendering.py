@@ -130,13 +130,19 @@ class TestGemma4TemplateRendering:
         With the text left on the tool-calling message, the template places it
         after the tool response and closes the turn; the generation prompt is
         then skipped, so the model continues outside any turn and leaks its
-        channel marker as plain ``thought`` text.
+        channel marker as plain ``thought`` text. A separate text-only message
+        would close the turn before the calls instead.
         """
         openai_msgs = [
             Message(role="user", content="What's the weather?"),
             Message(role="assistant", content="Checking now.", tool_calls=[_TC]),
             Message(role="tool", content="sunny", tool_call_id="c1"),
+            Message(role="assistant", content="Step two.", tool_calls=[
+                {**_TC, "id": "c2"}]),
+            Message(role="tool", content="still sunny", tool_call_id="c2"),
         ]
         rendered = _render(extract_gemma4_messages(openai_msgs), tools=_TOOLS)
         assert rendered.endswith("<tool_response|>"), rendered[-120:]
-        assert rendered.index("Checking now.") < rendered.index("<|tool_call>")
+        model_turn = rendered[rendered.rindex("<|turn>model\n"):]
+        assert "<turn|>" not in model_turn, model_turn
+        assert model_turn.count("<|tool_call>") == 2

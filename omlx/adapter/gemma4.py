@@ -89,9 +89,9 @@ def extract_gemma4_messages(
     - Passes non-tool messages through unchanged.
     - Preserves ``tool_calls`` on assistant turns (template renders them
       as ``<|tool_call>...</tool_call|>``).
-    - Splits assistant text that accompanies ``tool_calls`` into a preceding
-      assistant message, so the tool-calling message carries no content and
-      its turn stays open for the model to continue after the tool results.
+    - Omits assistant text that accompanies ``tool_calls`` (the pre-call
+      preamble). The template can only place it after the tool responses,
+      where it closes the turn the model must continue after the results.
     - Folds consecutive ``role=tool`` messages that follow an assistant
       turn into a single ``{"role": "assistant", "tool_responses": [...]}``
       message, resolving function names from the preceding tool_calls by
@@ -194,7 +194,7 @@ def extract_gemma4_messages(
             content = _strip_thinking(content)
             content = _strip_protocol_markers(content)
 
-            if tool_calls_raw and isinstance(content, str) and content.strip():
+            if tool_calls_raw:
                 # OpenAI puts the text a model wrote *before* its tool calls in
                 # the same message as the calls. The Gemma 4 template renders a
                 # message's content *after* its tool responses and then closes
@@ -202,16 +202,11 @@ def extract_gemma4_messages(
                 # generation prompt is also skipped (it only follows a
                 # tool_response/tool_call), so the model is asked to continue
                 # outside any turn and spells its channel marker as plain text
-                # (``thought\n...``) in visible content. Emit the preamble as its
-                # own model message first so it keeps its chronological place
-                # before the calls and the tool-calling message ends open.
-                processed.append(
-                    {
-                        "role": "assistant",
-                        "content": content,
-                        _PRESERVE_BOUNDARY_KEY: True,
-                    }
-                )
+                # (``thought\n...``) in visible content. The template has no
+                # place for text inside a turn before a call: a separate
+                # text-only message closes the turn itself and the calls that
+                # follow land outside it. Render the tool-calling step without
+                # that preamble so every turn in the history stays well formed.
                 content = ""
 
             out_msg: dict = {"role": "assistant", "content": content or ""}
