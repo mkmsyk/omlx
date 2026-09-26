@@ -54,6 +54,21 @@ def _independent_verify(model):
     return False
 
 
+def _set_draft_row(model, row):
+    """Name the shared-verify row whose draft chain runs next.
+
+    Heads that draft against the backbone's captured K/V (Gemma 4) keep one
+    batched capture per verify; the row index selects that request's span.
+    """
+    for host in (
+        model,
+        getattr(model, "language_model", None),
+        getattr(model, "_language_model", None),
+    ):
+        if host is not None:
+            host._omlx_mtp_draft_row = row
+
+
 def advance(batch, batch_state):
     """Advance empty row queues, sharing equal-depth target verification.
 
@@ -206,6 +221,7 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
         # commit() replaces this shared view before the request's head runs.
         row.prompt_cache = cache
         bg._set_singleton_mrope_delta(row)
+        _set_draft_row(batch.model, row_index)
         result = bg._run_verify_cycle_chain(
             row,
             state,
@@ -246,8 +262,9 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
             cache, gdn, [accepted for accepted, _ in deferred], depth + 1
         )
         commit_ms = (time.perf_counter() - started) * 1000 / len(rows)
-        for (index, row, _), (_, finish) in zip(rows, deferred):
+        for row_index, ((index, row, _), (_, finish)) in enumerate(zip(rows, deferred)):
             bg._set_singleton_mrope_delta(row)
+            _set_draft_row(batch.model, row_index)
             finish(commit_ms)
             # Boundary forwards advance private row caches that must be merged back.
             if not whole_batch or row.prompt_cache is not cache:
@@ -257,5 +274,6 @@ def _advance_group(batch, depth, rows, replacements, *, cache=None):
             batch.prompt_cache = cache
     if draft_jobs is not None:
         batched_head.draft(batch, draft_jobs)
+    _set_draft_row(batch.model, None)
     bg._clear_rollback(cache)
     return vector_rollback and whole_batch and not replacements

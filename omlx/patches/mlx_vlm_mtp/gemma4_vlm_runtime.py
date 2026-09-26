@@ -167,6 +167,13 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         return
 
     from mlx_vlm.models.base import LanguageModelOutput
+    from mlx_vlm.speculative.cache_state import (
+        SpeculativeCacheTransaction,
+        start_speculative_cache,
+    )
+    from mlx_vlm.speculative.cache_state import (
+        rollback_speculative_cache as rollback_cache_transaction,
+    )
     from mlx_vlm.speculative.drafters.gemma4_assistant import (
         Gemma4AssistantDraftModel,
         ModelConfig as Gemma4AssistantConfig,
@@ -175,6 +182,7 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
 
     original_init = cls.__init__
     original_call = cls.__call__
+    original_rollback = cls.rollback_speculative_cache
 
     def __init__(self, config):
         from . import is_mtp_attach_enabled
@@ -213,27 +221,94 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         sink = kwargs.pop("shared_kv_sink", None)
         if sink is None:
             sink = {}
-        out = original_call(
-            self,
-            inputs,
-            inputs_embeds,
-            mask,
-            cache,
-            shared_kv_sink=sink,
-            **kwargs,
-        )
+        # Multi-row verify blocks end with a different accepted count per
+        # row. The stock trim rejects ragged accepts (mlx-vlm #1962), so the
+        # shared verify runs inside a cache transaction that keeps each
+        # row's accepted prefix (rotating windows replay accepted K/V).
+        # Singleton forwards keep the stock trim + undo path unchanged.
+        batched = int(inputs.shape[0]) > 1
+        transaction = start_speculative_cache(cache or [], inputs.shape[1]) if batched else None
+        try:
+            out = original_call(
+                self,
+                inputs,
+                inputs_embeds,
+                mask,
+                cache,
+                shared_kv_sink=sink,
+                **kwargs,
+            )
+        except BaseException:
+            if transaction is not None:
+                transaction.abort()
+            raise
         self._omlx_mtp_shared_kv = sink
         self._omlx_mtp_cache_ref = cache
-        # Committed length at capture time. A later rollback lowers the
-        # live cache counters below this, and mtp_forward slices the
-        # rejected tail off the stashed banks by the difference.
-        self._omlx_mtp_kv_offset = _mtp_query_position(self)
+        if batched:
+            # Per-row processed lengths at capture. Every row of a stashed
+            # bank ends at the same (right-aligned) slot, so a row's
+            # committed span is located by comparing these with the
+            # post-rollback lengths (see _row_shared_kv).
+            self._omlx_mtp_row_offsets = _row_offsets(cache)
+            self._omlx_mtp_kv_offset = None
+        else:
+            self._omlx_mtp_row_offsets = None
+            # Committed length at capture time. A later rollback lowers the
+            # live cache counters below this, and mtp_forward slices the
+            # rejected tail off the stashed banks by the difference.
+            self._omlx_mtp_kv_offset = _mtp_query_position(self)
         return LanguageModelOutput(
             logits=out.logits,
             hidden_states=out.hidden_states,
-            gdn_states=[],
+            gdn_states=transaction if batched else [],
             shared_kv_states=sink,
         )
+
+    def rollback_speculative_cache(self, caches, gdn_states, accepted, block_size):
+        """Commit ragged accepts through the verify transaction when present."""
+        if isinstance(gdn_states, SpeculativeCacheTransaction):
+            return rollback_cache_transaction(caches, gdn_states, accepted, block_size)
+        return original_rollback(self, caches, gdn_states, accepted, block_size)
+
+    def _row_offsets(cache) -> list[int]:
+        """Per-row processed token counts of a batched cache list."""
+        for c in cache or []:
+            offset = getattr(c, "offset", None)
+            if isinstance(offset, mx.array) and offset.ndim == 1:
+                return [int(v) for v in offset.tolist()]
+        raise RuntimeError("gemma4 batched MTP: no per-row cache offset available")
+
+    def _row_shared_kv(self, row: int):
+        """Row ``row``'s committed shared K/V from a batched verify capture.
+
+        Each stashed bank is right-aligned: every row's newest verify slot
+        sits at the bank's last index. A row that accepted fewer drafts
+        than the verify depth ends ``capture - committed`` slots earlier.
+        The span is sliced to the row's committed tokens (bounded by the
+        bank's length for the sliding window), which is exactly the compact
+        layout of a singleton capture.
+        """
+        captured = self._omlx_mtp_row_offsets[row]
+        committed = _row_offsets(self._omlx_mtp_cache_ref)[row]
+        rejected = captured - committed
+        if rejected < 0:
+            raise RuntimeError(
+                f"gemma4 batched MTP: row {row} grew after capture "
+                f"({captured} -> {committed})"
+            )
+        banks = {}
+        for layer_type, (keys, values) in self._omlx_mtp_shared_kv.items():
+            end = int(keys.shape[-2]) - rejected
+            start = max(end - committed, 0)
+            if end <= start:
+                raise RuntimeError(
+                    f"gemma4 batched MTP: empty {layer_type} span for row {row}"
+                )
+            banks[layer_type] = (
+                keys[row : row + 1, :, start:end, :],
+                values[row : row + 1, :, start:end, :],
+            )
+        return banks, committed
 
     def _mtp_query_position(self) -> int:
         """Current committed length = the drafter's constant query position.
@@ -301,14 +376,25 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
         tok_embed = drafter._input_embed(ids) * drafter._input_embed_scale
         inputs_embeds = mx.concatenate([tok_embed.astype(h.dtype), h], axis=-1)
 
-        # Committed length (post-rollback). The stash was captured at the
-        # verify forward, so on a rejection it still carries the rejected
-        # draft rows in the tail — slice them off (verify captures are
-        # temporal-ordered, mirrors _mtp_rounds' post-reject slicing).
-        valid_len = _mtp_query_position(self)
-        rejected = getattr(self, "_omlx_mtp_kv_offset", valid_len) - valid_len
-        if rejected > 0:
-            shared_kv = _slice_shared_kv_after_reject(shared_kv, rejected)
+        if getattr(self, "_omlx_mtp_row_offsets", None) is not None:
+            # Batched capture: the Lightning batch loop names the verify row
+            # this draft belongs to (``_omlx_mtp_draft_row``).
+            row = getattr(self, "_omlx_mtp_draft_row", None)
+            if row is None or h.shape[0] != 1:
+                raise RuntimeError(
+                    "gemma4 mtp_forward: batched shared K/V needs one draft "
+                    f"row (row={row}, hidden rows={h.shape[0]})"
+                )
+            shared_kv, valid_len = _row_shared_kv(self, row)
+        else:
+            # Committed length (post-rollback). The stash was captured at the
+            # verify forward, so on a rejection it still carries the rejected
+            # draft rows in the tail — slice them off (verify captures are
+            # temporal-ordered, mirrors _mtp_rounds' post-reject slicing).
+            valid_len = _mtp_query_position(self)
+            rejected = getattr(self, "_omlx_mtp_kv_offset", valid_len) - valid_len
+            if rejected > 0:
+                shared_kv = _slice_shared_kv_after_reject(shared_kv, rejected)
 
         # The drafter's constant query position is the position of the
         # hidden's token — the last committed slot, not the next one
@@ -326,6 +412,11 @@ def _patch_vlm_language_model(g4_lang: Any) -> None:
 
     cls.__init__ = __init__
     cls.__call__ = __call__
+    cls.rollback_speculative_cache = rollback_speculative_cache
     cls.mtp_forward = mtp_forward
     cls.make_mtp_cache = make_mtp_cache
+    # Shared verification: rows keep request-local acceptance and draft
+    # context; the verify transaction commits ragged accepts per row.
+    cls._omlx_mtp_multi_request = True
+    cls._omlx_mtp_batch_rollback = True
     cls._omlx_mtp_runtime_patched = True

@@ -172,6 +172,72 @@ def test_l_gate_routes_only_small_steps():
     )
 
 
+def _merged_cache(lm, prompts):
+    """Batch caches merged from per-prompt caches (left-padded like prefill)."""
+    from mlx_vlm.models import cache as vlm_cache
+
+    singles = []
+    for prompt in prompts:
+        cache = lm.make_cache()
+        mx.eval(lm(mx.array([prompt]), cache=cache).logits)
+        singles.append(cache)
+    merged = []
+    for layer in zip(*singles):
+        batch_cls = (
+            vlm_cache.BatchRotatingKVCache
+            if isinstance(layer[0], vlm_cache.RotatingKVCache)
+            else vlm_cache.BatchKVCache
+        )
+        merged.append(batch_cls.merge(list(layer)))
+    return merged
+
+
+def _count_step_single_updates(lm, cache, step):
+    single = {"n": 0}
+    originals = []
+    for c in cache:
+        original = c.update_and_fetch
+        originals.append((c, original))
+
+        def wrapper(k, v, _orig=original):
+            if k.shape[2] == 1:
+                single["n"] += 1
+            return _orig(k, v)
+
+        c.update_and_fetch = wrapper
+    try:
+        mx.eval(lm(mx.array(step), cache=cache).logits)
+    finally:
+        for c, _ in originals:
+            del c.update_and_fetch
+    return single["n"]
+
+
+def test_multi_row_verify_stays_on_stock_path():
+    # The routes ignore the attention mask, so a multi-request verify keeps
+    # the stock masked forward even while its rows happen to be compact:
+    # a ragged commit adds per-row padding in place afterwards.
+    lm = _language_model()
+    for prompts in (
+        [list(range(3, 15)), list(range(20, 32))],
+        [list(range(3, 15)), list(range(20, 26))],
+    ):
+        cache = _merged_cache(lm, prompts)
+        assert _count_step_single_updates(lm, cache, [[1, 2], [3, 4]]) == 0
+
+
+def test_padding_verdict_follows_rebound_padding():
+    # A compact single-row cache routes; once its padding array is rebound
+    # to a padded layout (filter / extend / merge), the stale "compact"
+    # verdict must not keep the mask-free route.
+    lm = _language_model()
+    cache = _merged_cache(lm, [list(range(3, 15))])
+    assert _count_step_single_updates(lm, cache, [[1, 2]]) > 0
+    for c in cache:
+        c.left_padding = mx.array([1])
+    assert _count_step_single_updates(lm, cache, [[5, 6]]) == 0
+
+
 # --- fused kernel route (head_dim % 32 == 0 -> global layers) ---------------
 
 KERNEL_TEXT_CONFIG = dict(

@@ -180,6 +180,18 @@ def _attach_rotating_undo() -> bool:
         BatchRotatingKVCache,
         ("keys", "values", "offset", "_offset", "_idx", "rotated", "left_padding"),
     )
+    # mlx-vlm keeps its own rotating classes (the Gemma 4 VLM path serves
+    # through them). An in-place verify update overwrites ring slots there
+    # too, so the same undo log is required for an exact rejection.
+    try:
+        from mlx_vlm.models import cache as vlm_cache
+    except ImportError:
+        return True
+    _wrap_rotating(vlm_cache.RotatingKVCache, ("keys", "values", "offset", "_idx"))
+    _wrap_rotating(
+        vlm_cache.BatchRotatingKVCache,
+        ("keys", "values", "offset", "_offset", "_idx", "rotated", "left_padding"),
+    )
     return True
 
 

@@ -38,8 +38,8 @@ Scope gates (everything else passes through unchanged):
   26B/31B): on E2B/E4B a decomposed donor would hand downstream shared
   layers a final-token KV view they cannot causally slice on a rotated
   ring;
-- zero left padding (memoized per cache object; the singleton MTP path
-  guarantees compact caches);
+- single-row verify (B == 1) with zero left padding (memoized per padding
+  array; a multi-request verify keeps the stock masked path);
 - the kernel route additionally requires a lane-splittable head_dim and a
   plain 4-D KV buffer of the activations dtype (quantized caches fall
   back to per-token).
@@ -91,14 +91,18 @@ def apply() -> bool:
         left = getattr(cache, "left_padding", None)
         if left is None:
             return True
+        # Memoized per padding array: filter / extend / merge rebind it, so a
+        # cache that later gains padded rows is re-checked instead of reusing
+        # a stale "compact" verdict with the mask-free routes below.
         cached = getattr(cache, "_omlx_zero_left_pad", None)
-        if cached is None:
+        if cached is None or cached[0] is not left:
             try:
-                cached = max(int(v) for v in left.tolist()) == 0
+                zero = max(int(v) for v in left.tolist()) == 0
             except Exception:
-                cached = False
+                zero = False
+            cached = (left, zero)
             cache._omlx_zero_left_pad = cached
-        return cached
+        return cached[1]
 
     def _kernel_cache_ok(cache, dtype) -> bool:
         keys = getattr(cache, "keys", None)
@@ -118,6 +122,9 @@ def apply() -> bool:
             shared_kv is not None
             or cache is None
             or L < _MIN_L
+            # The routes ignore the mask; a multi-request verify carries
+            # per-row padding and ragged commits, so it keeps the stock path.
+            or B != 1
             or getattr(self.config, "num_kv_shared_layers", 0)
             or not _zero_left_padding(cache)
         ):

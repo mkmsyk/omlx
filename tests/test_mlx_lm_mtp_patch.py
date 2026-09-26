@@ -2499,6 +2499,18 @@ class TestRotatingCacheMtpUndo:
 
         self._run_equivalence(lambda: BatchRotatingKVCache(8, [0]), num_drafts=8)
 
+    @pytest.mark.parametrize("num_drafts", [1, 2])
+    def test_vlm_rotating_caches_undo(self, num_drafts):
+        # The Gemma 4 VLM path serves through mlx-vlm's own rotating classes.
+        vlm_cache = pytest.importorskip("mlx_vlm.models.cache")
+
+        self._run_equivalence(
+            lambda: vlm_cache.RotatingKVCache(max_size=8), num_drafts=num_drafts
+        )
+        self._run_equivalence(
+            lambda: vlm_cache.BatchRotatingKVCache(8, [0]), num_drafts=num_drafts
+        )
+
     def test_unarmed_update_keeps_stock_semantics(self):
         import mlx.core as mx
 
@@ -3980,9 +3992,10 @@ def test_qwen_late_join_preserves_cache_without_history_replay(family, monkeypat
         ("qwen4", True),
         # V4.1 owns its depth controller; the common override does not apply.
         ("v41", False),
+        ("gemma", False),
+        ("gemma", True),
         # Singleton-only adapters need batching/late-join checks, not a
         # duplicate matrix for a multi-request depth policy they never use.
-        ("gemma", False),
         ("v4_dspark", False),
         ("inkling", False),
         ("nemotron", False),
@@ -4023,7 +4036,14 @@ def test_multi_request_mtp_or_singleton_only_matches_standard(
             monkeypatch.setattr(bg._DepthController, "observe", observe)
         mx.random.seed(173)
         model = _model(family)
-        batch_supported = family in {"qwen", "qwen_vlm", "qwen4", "v41", "glm5"}
+        batch_supported = family in {
+            "qwen",
+            "qwen_vlm",
+            "qwen4",
+            "v41",
+            "glm5",
+            "gemma",
+        }
         assert bg._model_supports_batch_mtp(model) is batch_supported
         mx.eval(model.parameters())
         host = getattr(
@@ -4043,7 +4063,7 @@ def test_multi_request_mtp_or_singleton_only_matches_standard(
         draft_depths = set()
         shared_shapes = []
         batch_accepts = []
-        if family in {"qwen_vlm", "glm5"}:
+        if family in {"qwen_vlm", "glm5", "gemma"}:
             rollback = host.rollback_speculative_cache
 
             def record_rollback(cache, gdn, accepted, block_size):
@@ -4092,15 +4112,92 @@ def test_multi_request_mtp_or_singleton_only_matches_standard(
         assert set(calls) == set(
             range(batch_size)
         ), "Every UID must execute MTP, not standard fallback"
-        if unequal_depths and family in {"qwen", "qwen_vlm", "glm5"}:
+        if unequal_depths and family in {"qwen", "qwen_vlm", "glm5", "gemma"}:
             assert len(draft_depths) > 1, "The mismatched-depth case must vary depths"
         if family not in {"v41", "step"}:
             assert shared_shapes, "Chain models must share target verification"
-        if family in {"qwen_vlm", "glm5"} and not unequal_depths and not late_join:
+        if (
+            family in {"qwen_vlm", "glm5", "gemma"}
+            and not unequal_depths
+            and not late_join
+        ):
             assert batch_accepts, "Use the model's vector rollback contract"
     finally:
         mlx_lm_mtp.set_mtp_active(previous)
         mlx_lm_mtp.set_mtp_depth(depth)
+
+
+@pytest.mark.parametrize("accepted", [[2, 0], [0, 2], [1, 1]])
+def test_gemma_batched_draft_rows_match_singleton_drafts(accepted, monkeypatch):
+    """A shared verify must hand each row's head exactly its own context.
+
+    Output correctness is guarded by verification, so a wrong K/V span would
+    only lower acceptance silently. Compare every row's first draft logits
+    after a ragged shared verify with the same row verified on its own.
+    """
+    from mlx_vlm.models import cache as vlm_cache
+
+    from omlx.patches import gemma4_verify_attention
+    from omlx.patches.mlx_lm_mtp import fused_batch
+
+    # The tiny head_dim takes the per-token verify route, whose capture keeps
+    # the sliding ring's physical order. Production head dims take MLX's
+    # fused temporal path; compare under that layout.
+    monkeypatch.setattr(gemma4_verify_attention, "_MIN_L", 99)
+    previous = mlx_lm_mtp.is_mtp_active()
+    try:
+        mlx_lm_mtp.set_mtp_active(True)
+        cache_rollback.apply()
+        mx.random.seed(11)
+        model = _model("gemma")
+        mx.eval(model.parameters())
+        host = model._language_model
+        prompts = [list(range(3, 14)), [20, 21, 22, 23, 24]]
+        blocks = [[30, 31, 32], [40, 41, 42]]
+
+        def prefill(prompt):
+            cache = model.make_cache()
+            mx.eval(model(mx.array([prompt]), cache=cache))
+            return cache
+
+        def draft(hidden, token):
+            logits = model.mtp_forward(
+                hidden, mx.array([[token]], dtype=mx.uint32), []
+            )
+            mx.eval(logits)
+            return logits
+
+        singles = [prefill(p) for p in prompts]
+        batch = []
+        for layer in zip(*singles):
+            cls = (
+                vlm_cache.BatchRotatingKVCache
+                if isinstance(layer[0], vlm_cache.RotatingKVCache)
+                else vlm_cache.BatchKVCache
+            )
+            batch.append(cls.merge(list(layer)))
+        _, hidden, gdn = bg._call_backbone(
+            model, mx.array(blocks), batch, n_confirmed=1
+        )
+        host.rollback_speculative_cache(batch, gdn, accepted, 3)
+        bg._clear_rollback(batch)
+        batched = []
+        for row, m in enumerate(accepted):
+            fused_batch._set_draft_row(model, row)
+            batched.append(draft(hidden[row : row + 1, m : m + 1], blocks[row][m]))
+        fused_batch._set_draft_row(model, None)
+
+        for row, m in enumerate(accepted):
+            cache = prefill(prompts[row])
+            _, h, gdn_s = bg._call_backbone(
+                model, mx.array([blocks[row]]), cache, n_confirmed=1
+            )
+            assert bg._chain_rollback(model, cache, m, 2, gdn_s)
+            bg._clear_rollback(cache)
+            single = draft(h[:, m : m + 1], blocks[row][m])
+            assert mx.allclose(batched[row], single, atol=1e-3, rtol=1e-3), row
+    finally:
+        mlx_lm_mtp.set_mtp_active(previous)
 
 
 @pytest.mark.parametrize("size", [2, 4])
