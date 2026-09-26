@@ -21,6 +21,7 @@
 | [oMLX人間sessionのPassport一元化](internal/session-passport-auth-20260912.md) | 管理画面とネイティブアプリの認証経路変更 |
 | [Passport Cookie更新の統一](internal/session-passport-cookie-renewal-20260913.md) | Passportのrolling expiryを管理面Cookieへ共通middlewareで再中継 |
 | [oMLX upstream土台更新](internal/session-upstream-foundation-20260918.md) | upstream統合、依存更新、native kernel再ビルド、全体テスト |
+| [Gemma 4のツール前本文によるthought漏れ](internal/session-gemma4-preamble-turn-20260926.md) | tool_calls付き本文がターンを閉じ、生成が`thought`平文で始まる原因の実測と変換層での修正 |
 
 [管制管理下のprefill退避](internal/session-managed-prefill-20260910.md)。
 

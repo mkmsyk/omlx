@@ -333,6 +333,64 @@ class TestExtractGemma4Messages:
         result = extract_gemma4_messages([msg])
         assert result == []
 
+    def test_text_before_tool_calls_becomes_preceding_message(self):
+        """OpenAI keeps pre-call text with the calls; Gemma 4 needs it first."""
+        messages = [
+            Message(role="user", content="Look it up"),
+            Message(
+                role="assistant",
+                content="I will search first.",
+                tool_calls=[_tool_call_dict("c1", "search")],
+            ),
+            _tool_result("c1", "found it"),
+        ]
+        result = extract_gemma4_messages(messages)
+        assert [m["role"] for m in result] == ["user", "assistant", "assistant"]
+        assert result[1]["content"] == "I will search first."
+        assert "tool_calls" not in result[1]
+        assert result[2]["content"] == ""
+        assert result[2]["tool_calls"][0]["function"]["name"] == "search"
+        assert result[2]["tool_responses"] == [
+            {"name": "search", "response": "found it"}
+        ]
+
+    def test_text_before_each_tool_step_keeps_order(self):
+        """Every tool step keeps its own text ahead of its calls."""
+        messages = [
+            Message(role="user", content="Look it up"),
+            Message(
+                role="assistant",
+                content="Step one.",
+                tool_calls=[_tool_call_dict("c1", "search")],
+            ),
+            _tool_result("c1", "r1"),
+            Message(
+                role="assistant",
+                content="Step two.",
+                tool_calls=[_tool_call_dict("c2", "fetch")],
+            ),
+            _tool_result("c2", "r2"),
+        ]
+        result = extract_gemma4_messages(messages)
+        assert [(m["content"], bool(m.get("tool_calls"))) for m in result[1:]] == [
+            ("Step one.", False),
+            ("", True),
+            ("Step two.", False),
+            ("", True),
+        ]
+
+    def test_whitespace_before_tool_calls_is_not_split(self):
+        """Whitespace-only content is not a preamble and stays on the call."""
+        msg = Message(
+            role="assistant",
+            content="\n",
+            tool_calls=[_tool_call_dict("c1", "search")],
+        )
+        result = extract_gemma4_messages([msg])
+        assert len(result) == 1
+        assert result[0]["content"] == "\n"
+        assert "tool_calls" in result[0]
+
 
 class TestStripThinking:
     """``_strip_thinking`` removes leading thought blocks only."""

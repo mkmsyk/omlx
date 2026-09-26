@@ -16,6 +16,9 @@ from omlx.api.openai_models import Message
 
 
 def _find_gemma4_26b_model() -> str | None:
+    explicit = os.environ.get("OMLX_GEMMA4_MODEL_PATH")
+    if explicit:
+        return explicit
     pattern = os.path.join(
         os.path.expanduser("~"), ".omlx", "models", "gemma-4-26B-A4B-it*"
     )
@@ -26,7 +29,7 @@ def _find_gemma4_26b_model() -> str | None:
 MODEL_PATH = _find_gemma4_26b_model()
 
 pytestmark = pytest.mark.skipif(
-    MODEL_PATH is None, reason="No gemma-4-26B-A4B-it* model found in ~/.omlx/models/"
+    MODEL_PATH is None, reason="No gemma-4-26B-A4B-it* model found in ~/.omlx/models/ (or OMLX_GEMMA4_MODEL_PATH)"
 )
 
 _TOOLS = [
@@ -120,3 +123,20 @@ class TestGemma4TemplateRendering:
         assert opens == closes, (
             f"Still imbalanced after fix: opens={opens} closes={closes}"
         )
+
+    def test_text_before_tool_call_keeps_model_turn_open(self):
+        """Pre-call text must not close the turn the model continues after tools.
+
+        With the text left on the tool-calling message, the template places it
+        after the tool response and closes the turn; the generation prompt is
+        then skipped, so the model continues outside any turn and leaks its
+        channel marker as plain ``thought`` text.
+        """
+        openai_msgs = [
+            Message(role="user", content="What's the weather?"),
+            Message(role="assistant", content="Checking now.", tool_calls=[_TC]),
+            Message(role="tool", content="sunny", tool_call_id="c1"),
+        ]
+        rendered = _render(extract_gemma4_messages(openai_msgs), tools=_TOOLS)
+        assert rendered.endswith("<tool_response|>"), rendered[-120:]
+        assert rendered.index("Checking now.") < rendered.index("<|tool_call>")
