@@ -50,6 +50,15 @@ Sidekicks側の同時調査で、実経路でも外す形が良いと実測さ�
   - `tests/test_gemma4_rendering.py`へ、2ステップの履歴で最後のmodel発話が閉じずtool呼出しを2件含むかの描画検査を追加した。
   - 描画検査は、`OMLX_GEMMA4_MODEL_PATH=<snapshot>`で実モデルのテンプレートを指定して実行した。
 
+## 配備後の確認
+
+- Krisisの管制モードで`0.7.0.dev4-8e3a877`（`~/.venvs/omlx-current` → `omlx-0.7.0.dev4-8e3a877`）に反映された（2026-09-26 01:26:54Z）。
+  release venvでの`pytest -m "not slow"`は14,277 passed / 61 skippedだった。
+- 本番の`/v1/chat/completions`へ、失敗スレッドを前置き文付きの元の履歴のまま送った（enable_thinking=false）。
+  - prefix 6（失敗ターン）: 4/4が`reasoning:"\n"`の後に本文で始まり、`thought`の平文漏れは0件だった。
+    配備前は同じ手順で2/2が`content:"thought\n"`で始まっていた。
+  - prefix 4: 2/2が正しい`SearchWeb`呼出しだった。
+
 ## 残TODO
 
 - 空のthoughtでも`<think>\n`由来の`reasoning_content:"\n"`が出る。表示上の小さな雑音で、本件の修正対象外。
