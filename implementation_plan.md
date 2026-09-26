@@ -2,7 +2,7 @@
 
 <!-- 完了した計画は docs/omlx/ へ移す。 -->
 
-状態：計画（ユーザー承認待ち）／作成 2026-09-26
+状態：承認済み（2026-09-26）・段階 0 実施中／作成 2026-09-26
 
 ## 1. 目的と成功条件
 
@@ -40,10 +40,12 @@ Gemma 4（26B-A4B qat 6bit、31B 6bit）で、同じモデルへの同時要求�
 
 ## 4. 作業段階
 
-### 段階 0：土台を上流へ追随（`omlx-update` 手順）
+### 段階 0：Gemma Lightning の上流修正を取り込む（`omlx-update` 手順）
 
-- `$omlx-update` の手順で `origin/main` を統合し、fork の独自修正（Passport、管制連携、Gemma 4 preamble 修正など）を保ったまま再ビルド・全体試験を通す。Krisis の管制モード「oMLX更新による再起動」で配備する。
-- 理由：#3561 の Gemma Lightning 修正が前提になる。また `batch_generator.py` は上流で大きく動いており（#3797 で +509 行）、古い土台の上で改造すると統合時の衝突が大きい。
+- `omlx-update` は上流の正式版タグだけを追う。2026-09-26 の `check` は `updateAvailable: false`（最新正式版 v0.6.4、稼働 0.7.0.dev4）で、#3561 は rc 版にしか無い。そこで上流全体は統合せず、次の 2 件だけを fork の `main` へ cherry-pick し、`prepare --current` で配備する。
+  - `9acba360`（#3561）：text-only 統合モデルの経路、head の dtype 揃え、head の早期 bind 廃止（量子化前の埋め込みを掴んで 31B で 5.6 GB を余計に確保する不具合の修正）。
+  - `b6c7721e`：text-only Gemma 4 への画像入力拒否。`omlx/engine/vlm.py` の競合は、fork に無い mimo_v2 の動画展開を除いて拒否部分だけ取り込んだ。
+- 上流全体（#3797 などの Lightning 全般改修）の統合は、次の正式版タグで通常の更新として行う。本改造はそのときの衝突を抑えるため、patch モジュールと分岐追加に閉じる。
 - 完了条件：配備後に現行 `vlm_mtp` の 26B/31B が従来どおり動く（ログで `vlm_mtp stats`、Krisis `/control/status` 正常）。
 
 ### 段階 1：統合チェックポイントを作り、単発 Lightning を実測する（可否判定）
@@ -121,6 +123,10 @@ Gemma 4（26B-A4B qat 6bit、31B 6bit）で、同じモデルへの同時要求�
 - **速度が伸びない**：verify attention 近似を外す分、単発より 1 行あたりの verify が遅くなりうる。段階 1 の可否判定と段階 4 の実測で判断し、届かなければ 2.4 の kernel 拡張を別計画にする。
 - **上流との乖離**：改造は patch モジュールと `batched_head`・`fused_batch` の分岐追加に閉じ、上流ファイルの書き換えを最小にする。上流への提案（PR）はユーザー判断で別途。
 
-## 7. 付随：Qwen3.8 Flash-Next
+## 7. 将来の検討事項（本計画の範囲外）
+
+- MTP と DFlash の併用（2 系統の下書きを同じ verify で検証、または周回ごとに選択）。上流は `mtp_enabled` と `dflash_enabled` の同時有効を禁止している。1 要求時は得をしうるが、複数行 verify では検証トークン数の増加がバッチ利得を食い合う。26B/31B 用 DFlash 下書きモデルの有無も未確認。本計画の段階 4 の実測後に検討する（2026-09-26 ユーザー合意）。
+
+## 8. 付随：Qwen3.8 Flash-Next
 
 2026-09-26、`Jundot--Qwen3.8-Flash-Next-oQ4e-mtp` の `mtp_enabled` を true にした（管理 API、検証は 200 で通過）。`qwen4_exp` は Lightning 複数要求に対応済み。次回ロードから有効になり、動作確認は未実施（非常駐のため）。
