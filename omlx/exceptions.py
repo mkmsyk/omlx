@@ -253,6 +253,28 @@ class RequestError(SchedulerError):
         self.request_id = request_id
 
 
+class RequestOutputError(RequestError, RuntimeError):
+    """A request finished with ``finish_reason="error"`` and a typed code.
+
+    The scheduler records ``error_code`` (e.g. ``memory_admission_stalled``)
+    and ``error_metadata`` on the RequestOutput. Raising a bare RuntimeError
+    dropped them, so HTTP clients only received the English message and had
+    to parse it. RuntimeError stays a base for existing handlers.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[str] = None,
+        request_id: Optional[str] = None,
+        metadata: Optional[dict] = None,
+    ):
+        super().__init__(message, request_id=request_id)
+        self.code = code
+        self.metadata = dict(metadata or {})
+
+
 class RequestNotFoundError(RequestError):
     """Request was not found in the scheduler."""
 

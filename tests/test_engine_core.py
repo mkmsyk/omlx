@@ -1975,3 +1975,17 @@ class TestMemoryAbortErrorSurface:
                 self._abort_output(error_code=None, error_metadata=None)
             )
         assert not isinstance(exc.value, PrefillMemoryExceededError)
+
+    def test_other_coded_error_keeps_code_and_metadata(self):
+        from omlx.exceptions import RequestOutputError
+
+        with pytest.raises(RequestOutputError) as exc:
+            _raise_request_output_error(self._abort_output(
+                error="Request could not be admitted because memory pressure persisted",
+                error_code="memory_admission_stalled",
+                error_metadata={"request_id": "req-abort", "reason": "admission_paused"},
+            ))
+        assert isinstance(exc.value, RuntimeError)
+        assert exc.value.code == "memory_admission_stalled"
+        assert exc.value.metadata["reason"] == "admission_paused"
+        assert str(exc.value) == "Request could not be admitted because memory pressure persisted"

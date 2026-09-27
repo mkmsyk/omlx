@@ -475,3 +475,21 @@ class TestStreamingErrorPayload:
 
         body = srv._streaming_error_payload(ValueError("boom"), "chat streaming")
         assert body == {"error": {"message": "boom", "type": "server_error"}}
+
+    def test_request_output_error_keeps_typed_code_and_reason(self):
+        import omlx.server as srv
+        from omlx.exceptions import RequestOutputError
+
+        e = RequestOutputError(
+            "Request could not be admitted because memory pressure persisted "
+            "for 60.4s (admission_paused).",
+            code="memory_admission_stalled",
+            request_id="req-stalled",
+            metadata={"request_id": "req-stalled", "reason": "admission_paused"},
+        )
+        body = srv._streaming_error_payload(e, "chat streaming")
+        assert body["error"]["type"] == "server_error"
+        assert body["error"]["code"] == "memory_admission_stalled"
+        assert body["error"]["omlx_code"] == "memory_admission_stalled"
+        assert body["error"]["reason"] == "admission_paused"
+        assert isinstance(e, RuntimeError)
