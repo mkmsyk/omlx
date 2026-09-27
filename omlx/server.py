@@ -3390,6 +3390,22 @@ async def unload_model(model_id: str, _: bool = Depends(verify_api_key), only_id
     return {"status": "ok", "model_id": model_id}
 
 
+@app.post("/v1/memory/reclaim")
+async def reclaim_pooled_memory(_: bool = Depends(verify_api_key)):
+    """管制の要求で、解放済みMetalバッファのプールをOSへ返させる。
+
+    enforcer が自分の soft 線を越えたときに使う経路（各スケジューラの step 境界で同期してから
+    clear する）をそのまま使う。実行中の推論を中断せず、Metal へ直接触れない。システム全体の
+    空きを見ているのは管制だけなので、プールを返す時機は管制が決める。
+    """
+    enforcer = _server_state.process_memory_enforcer
+    if enforcer is None:
+        return {"ok": False, "skipped": "memory_enforcer_disabled"}
+    pool_bytes = enforcer._pool_bytes()
+    requested = enforcer._request_scheduler_cache_reclaim(0)
+    return {"ok": True, "requested": requested, "poolBytes": pool_bytes}
+
+
 @app.post("/v1/models/{model_id}/load")
 async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
     """Load a discovered model into memory. Blocks until loading completes."""

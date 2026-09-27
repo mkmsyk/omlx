@@ -2629,7 +2629,12 @@ class EnginePool:
             entry = self._entries.get(model_id)
             if entry is None or not self._is_idle_for_prefill_eviction(entry):
                 return {"ok": False, "skipped": "model_busy_or_missing"}
-            await self._unload_engine(model_id)
+            try:
+                await self._unload_engine(model_id)
+            except ModelBusyError:
+                # 管制の最終防衛線が同じモデルを降ろしている最中。条件付きの回収は
+                # 見送りであって失敗ではない（未処理の500にしない）。
+                return {"ok": False, "skipped": "model_busy_or_missing"}
             return {"ok": True, "model_id": model_id}
 
     async def _unload_engine(self, model_id: str) -> None:

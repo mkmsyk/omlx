@@ -13,6 +13,7 @@
 
 ## 内部作業ログ
 
+| [session-control-pool-reclaim-20260927.md](internal/session-control-pool-reclaim-20260927.md) | 管制からのバッファプール返却要求と、SCRAM中の条件付き回収の500修正 |
 | [session-structured-translation-20260919.md](internal/session-structured-translation-20260919.md) | TranslateGemma structured content保持の実装判断と検証 |
 
 | 文書 | 内容 |

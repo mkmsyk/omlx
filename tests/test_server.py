@@ -1147,3 +1147,18 @@ def test_responses_reasoning_cache_policy(
         )
     assert response.status_code == 418, response.text
     assert engine.preflight_chat.call_args.kwargs["preserve_reasoning"] is expected
+
+
+def test_control_reclaims_pooled_memory_through_the_enforcer(monkeypatch):
+    # 管制がシステム全体の空きを見てプール返却を要求する。enforcer の既存経路をそのまま使う。
+    enforcer = MagicMock()
+    enforcer._pool_bytes.return_value = 27 * 1024**3
+    enforcer._request_scheduler_cache_reclaim.return_value = 2
+    monkeypatch.setattr(srv._server_state, "process_memory_enforcer", enforcer)
+    result = asyncio.run(srv.reclaim_pooled_memory(True))
+    assert result == {"ok": True, "requested": 2, "poolBytes": 27 * 1024**3}
+    enforcer._request_scheduler_cache_reclaim.assert_called_once_with(0)
+
+    monkeypatch.setattr(srv._server_state, "process_memory_enforcer", None)
+    assert asyncio.run(srv.reclaim_pooled_memory(True)) == {
+        "ok": False, "skipped": "memory_enforcer_disabled"}

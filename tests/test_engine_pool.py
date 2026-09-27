@@ -2366,6 +2366,15 @@ class TestEnginePoolPrefillEviction:
         pool._unload_engine.assert_awaited_once_with("idle")
 
     @pytest.mark.asyncio
+    async def test_conditional_control_unload_skips_a_teardown_in_progress(self):
+        # 管制の最終防衛線が同じモデルを降ろしている最中の条件付き回収は、500でなく見送り。
+        pool = _make_pool(ceiling=0)
+        pool._entries = {"idle": self._entry("idle", 60)}
+        pool._unload_engine = AsyncMock(side_effect=ModelBusyError("idle", "teardown"))
+        assert (await pool.unload_idle_for_control("idle")) == {
+            "ok": False, "skipped": "model_busy_or_missing"}
+
+    @pytest.mark.asyncio
     async def test_prefill_eviction_evicts_idle_lru_until_target(self):
         gb = 1024**3
         pool = _make_pool(ceiling=0)
