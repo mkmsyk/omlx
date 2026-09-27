@@ -1,4 +1,9 @@
-# 外付けMTPの要求ごとの割当（Krisis の MTP バトン、2026-09-27）
+# 外付けMTPの要求ごとの割当（Krisis の MTP バトン、2026-09-27、撤去済み）
+
+> **撤去済み。** 本番実測で混在時に生成量が大きく落ち、この機械の Gemma 4 では MTP とまとめ処理が同じ余力を
+> 取り合うため、ユーザー判断で `38f9e3c5` を取り消した（`mtp_mode`、1周まとめ出力、仮持ちの受け渡し、
+> `mtp_request_modes` の申告、`_return_running_request_to_waiting` の切り出し）。下は撤去前の記録。
+> 判断の詳細は Krisis `docs/internal/session-mtp-baton-20260927.md`。
 
 計画の正本は Krisis の `implementation_plan.md`（26BのMTPバトン）。
 
