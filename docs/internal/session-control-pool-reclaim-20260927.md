@@ -21,6 +21,14 @@ Krisis が 26B を降ろして Sidekicks 実行63件が `model_evicted`）。シ
 - `tests/test_engine_pool.py`・`tests/test_server.py`・`tests/test_process_memory_enforcer.py`（`-m "not slow"`）
   408件成功。追加：teardown 中の条件付き回収が見送りになること、reclaim が enforcer の既存経路を1回呼ぶこと。
 
+## 配備
+
+release `0.7.0.dev4-5f19dde` を Krisis の `tools/omlx-update.mjs` で配備した（apply 20:37〜20:42、verify は
+26B の推論で確認、finalize で本番線を `5f19dde5` に確定）。1回目の prepare 試験で
+`test_cluster_supervisor.py::test_run_worker_smoke_returns_complete_receipt` が本番推論と同時の全件試験の負荷で
+5秒の応答待ちを超えて落ち、単体3回成功・`--continue` の再試験で全件成功した。管制側の記録は Krisis の
+`docs/internal/session-scram-pool-reclaim-20260927.md`。
+
 ## 残TODO
 
-- `tools/omlx-update.mjs prepare --current` → apply → verify → finalize で配備する（Krisis の手順）。
+- 次に回収可能量が20GBを割ったとき、管制の要求とこのエンドポイントの返却が対応し、SCRAM が起きないことを観測する。
