@@ -1703,7 +1703,14 @@ class ProcessMemoryEnforcer:
                 self._walk_store_cache_caps()
                 return
 
-        if new_level == "hard":
+        if new_level in ("soft", "hard"):
+            # Soft pressure used to skip this ladder and go straight to model
+            # eviction while up to hot_cache_max_size of shared hot cache sat
+            # unreclaimed; with two models resident the soft overshoot is
+            # typically far smaller than the cache, so a whole model was
+            # unloaded to recover ~1GB. Both levels now try the
+            # non-destructive ladder (pooled-Metal reclaim, hot-cache shrink)
+            # before any eviction.
             freed_hot = await asyncio.to_thread(
                 self._shrink_hot_cache_for_pressure,
                 current,

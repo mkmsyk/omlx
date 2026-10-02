@@ -340,15 +340,19 @@ def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
 
     Guarded literal tags (see :data:`LITERAL_TAG_GUARD`) are not treated as
     boundaries; the guard is stripped from both returned parts.
+
+    With ``truncated=True``, unfinished thinking stays in the thinking channel.
     """
-    thinking, content = _extract_thinking_impl(text)
+    thinking, content = _extract_thinking_impl(text, truncated=truncated)
     return (
         unguard_literal_think_tags(thinking),
         unguard_literal_think_tags(content),
     )
 
 
-def _extract_thinking_impl(text: str) -> Tuple[str, str]:
+def _extract_thinking_impl(
+    text: str, *, truncated: bool = False
+) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
     Handles:
