@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -50,6 +51,7 @@ from ..model_settings import (
     resolve_vlm_mtp_conflicts,
     validate_ane_prefill,
     validate_moe_expert_offload,
+    MOE_OFFLOAD_MTP_MODEL_TYPES,
     merge_chat_template_kwargs,
 )
 from ..patches.moe_offload_compat import moe_offload_compatibility
@@ -314,7 +316,9 @@ class ModelSettingsRequest(BaseModel):
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # MTP draft tokens per cycle for legacy MTP (None = adaptive default).
-    mtp_num_draft_tokens: int | None = None
+    mtp_adaptive_max_depth: int | None = None
+    # Fixed Lightning MTP draft depth (None = adaptive).
+    mtp_fixed_depth: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
@@ -592,6 +596,8 @@ class GlobalSettingsRequest(BaseModel):
     auto_start_on_launch: bool | None = None
     burst_decode_mode: str | None = None  # "off" / "light" / "balanced" / "aggressive"
     preserve_mid_system_cache: bool | None = None
+    gpu_keep_warm_interval: float | None = None
+    qwen4_gdn_decode_wide_proj: bool | None = None
     distributed_inference_enabled: bool | None = None
     max_audio_upload_size: str | None = None
 
@@ -673,6 +679,7 @@ class GlobalSettingsRequest(BaseModel):
     integrations_openclaw_model: str | None = None
     integrations_hermes_model: str | None = None
     integrations_pi_model: str | None = None
+    integrations_dsh_model: str | None = None
     integrations_openclaw_tools_profile: (
         Literal["minimal", "coding", "messaging", "full"] | None
     ) = None
@@ -1350,6 +1357,10 @@ async def _apply_cache_settings_runtime(
         global_settings.cache.initial_cache_blocks
     )
 
+    pool._scheduler_config.paged_ssd_cache_auto_size = (
+        ssd_cache_max_size or global_settings.cache.ssd_cache_max_size
+    ).lower() == "auto"
+
     # Update scheduler config based on cache settings
     if enabled is False or (enabled is None and not global_settings.cache.enabled):
         pool._scheduler_config.paged_ssd_cache_dir = None
@@ -1768,6 +1779,13 @@ def get_system_memory_info() -> dict:
     except Exception:
         pass
 
+    try:
+        from ..process_memory_enforcer import preview_tier_ceilings
+
+        memory_guard_preview = preview_tier_ceilings()
+    except Exception:
+        memory_guard_preview = {}
+
     return {
         "total_bytes": total_bytes,
         "total_formatted": format_size(total_bytes),
@@ -1780,6 +1798,7 @@ def get_system_memory_info() -> dict:
         "free_memory_bytes": free_memory_bytes,
         "inactive_memory_bytes": inactive_memory_bytes,
         "active_memory_bytes": active_memory_bytes,
+        "memory_guard_preview": memory_guard_preview,
     }
 
 
@@ -2401,6 +2420,10 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "mtp_compatible": mtp_compat_ok,
             "mtp_compatibility_reason": mtp_compat_reason,
             "moe_expert_offload_supported": moe_offload_supported,
+            "moe_offload_allows_mtp": (
+                (model_info.get("config_model_type") or "").replace("-", "_").lower()
+                in MOE_OFFLOAD_MTP_MODEL_TYPES
+            ),
             "qwen4_ple_ssd_offload_supported": qwen4_ple_ssd_offload_supported,
             "qwen4_ple_ssd_offload_forced": qwen4_ple_ssd_offload_forced,
             "qwen4_ple_resident_bytes": qwen4_resident_bytes,
@@ -2767,17 +2790,19 @@ async def update_model_settings(
             if request.thinking_budget_tokens and request.thinking_budget_tokens > 0
             else None
         )
-    if "mtp_num_draft_tokens" in sent:
-        value = request.mtp_num_draft_tokens
+    for name in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
+        if name not in sent:
+            continue
+        value = getattr(request, name)
         if value is not None and not 1 <= value <= MAX_LIGHTNING_MTP_DRAFT_TOKENS:
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "mtp_num_draft_tokens must be between 1 and "
+                    f"{name} must be between 1 and "
                     f"{MAX_LIGHTNING_MTP_DRAFT_TOKENS} (or null)."
                 ),
             )
-        current_settings.mtp_num_draft_tokens = value
+        setattr(current_settings, name, value)
     if "preserve_thinking" in sent:
         current_settings.preserve_thinking = request.preserve_thinking
     if "cache_reasoning_output" in sent:
@@ -3321,14 +3346,18 @@ async def update_model_settings(
     )
     auto_unloaded = False
     auto_reloaded = False
+    reload_deferred = False
     if requires_reload:
         was_pinned = entry.is_pinned
         try:
             logger.info(
                 f"Settings changed for loaded model {model_id}, auto-unloading."
             )
-            await engine_pool._unload_engine(model_id)
-            auto_unloaded = True
+            # Busy engines (requests, benchmark runs) unload after they drain.
+            auto_unloaded = await engine_pool.request_unload(
+                model_id, reason="settings changed", abort_active=False
+            )
+            reload_deferred = not auto_unloaded
         except Exception as e:
             logger.warning(f"Auto-unload failed for {model_id}: {e}")
         if auto_unloaded and was_pinned:
@@ -3348,6 +3377,7 @@ async def update_model_settings(
         "requires_reload": requires_reload,
         "auto_unloaded": auto_unloaded,
         "auto_reloaded": auto_reloaded,
+        "reload_deferred": reload_deferred,
     }
 
 
@@ -3452,7 +3482,9 @@ def _validate_model_settings(entry, settings):
     from ..model_settings import validate_moe_expert_offload
 
     try:
-        validate_moe_expert_offload(settings)
+        validate_moe_expert_offload(
+            settings, model_type=getattr(entry, "config_model_type", None)
+        )
         if settings.get("moe_expert_offload_enabled"):
             from ..patches.moe_offload_compat import moe_offload_compatibility
 
@@ -3811,13 +3843,14 @@ def _feature_problem(
         ok, reason = _mtp_compat_for_model(info)
         if not ok:
             return reason or "Lightning MTP is not available for this model"
-        depth = snapshot.get("mtp_num_draft_tokens")
-        if depth is not None and (
-            isinstance(depth, bool)
-            or not isinstance(depth, int)
-            or not 1 <= depth <= MAX_LIGHTNING_MTP_DRAFT_TOKENS
-        ):
-            snapshot.pop("mtp_num_draft_tokens", None)
+        for key in ("mtp_adaptive_max_depth", "mtp_fixed_depth"):
+            depth = snapshot.get(key)
+            if depth is not None and (
+                isinstance(depth, bool)
+                or not isinstance(depth, int)
+                or not 1 <= depth <= MAX_LIGHTNING_MTP_DRAFT_TOKENS
+            ):
+                snapshot.pop(key, None)
         return None
     if name in ("turboquant", "index_cache"):
         is_paro, reason = _paroquant_compat_for_model(info)
@@ -3840,7 +3873,7 @@ def _feature_problem(
         return None
     if name == "moe_expert_offload":
         try:
-            validate_moe_expert_offload(snapshot)
+            validate_moe_expert_offload(snapshot, model_type=entry.config_model_type)
         except ValueError as error:
             return str(error)
         supported, reason = moe_offload_compatibility(entry.model_path)
@@ -3923,6 +3956,7 @@ async def _apply_settings_snapshot(
             "requires_reload": False,
             "auto_unloaded": False,
             "auto_reloaded": False,
+            "reload_deferred": False,
         }
     if reset:
         # Metadata the PUT contract does not carry.
@@ -4432,6 +4466,8 @@ async def get_global_settings_defaults(is_admin: bool = Depends(require_admin)):
 
 
 def _global_settings_response(global_settings):
+    from ..settings import get_auto_ssd_cache_size
+
     # Get system memory info for auto calculation
     memory_info = get_system_memory_info()
 
@@ -4452,10 +4488,16 @@ def _global_settings_response(global_settings):
             "sse_keepalive_mode": global_settings.server.sse_keepalive_mode,
             "auto_start_on_launch": global_settings.server.auto_start_on_launch,
             "burst_decode_mode": global_settings.server.burst_decode_mode,
+            "qwen4_gdn_decode_wide_proj": global_settings.server.qwen4_gdn_decode_wide_proj,
             "preserve_mid_system_cache": getattr(
                 global_settings.server,
                 "preserve_mid_system_cache",
                 True,
+            ),
+            "gpu_keep_warm_interval": getattr(
+                global_settings.server,
+                "gpu_keep_warm_interval",
+                0.5,
             ),
             "distributed_inference_enabled": getattr(
                 global_settings.server,
@@ -4501,12 +4543,8 @@ def _global_settings_response(global_settings):
         "cache": {
             "enabled": global_settings.cache.enabled,
             "ssd_cache_dir": cache_dir,
-            # Resolve "auto" to actual value (10% of SSD capacity)
-            "ssd_cache_max_size": _format_cache_size(
-                global_settings.cache.get_ssd_cache_max_size_bytes(
-                    global_settings.base_path
-                )
-            ),
+            "ssd_cache_max_size": global_settings.cache.ssd_cache_max_size,
+            "ssd_cache_auto_size_bytes": get_auto_ssd_cache_size(Path(cache_dir)),
             "hot_cache_only": global_settings.cache.hot_cache_only,
             "hot_cache_write_through": global_settings.cache.hot_cache_write_through,
             "ane_compile_cache": global_settings.cache.ane_compile_cache,
@@ -4568,6 +4606,7 @@ def _global_settings_response(global_settings):
             "hermes_model": global_settings.integrations.hermes_model,
             "pi_model": global_settings.integrations.pi_model,
             "copilot_model": global_settings.integrations.copilot_model,
+            "dsh_model": global_settings.integrations.dsh_model,
             "openclaw_tools_profile": global_settings.integrations.openclaw_tools_profile,
             "markitdown_enabled": global_settings.integrations.markitdown_enabled,
             "markitdown_expose_model": global_settings.integrations.markitdown_expose_model,
@@ -4596,6 +4635,7 @@ def _global_settings_response(global_settings):
             "omlx_wired_limit_request_bytes": memory_info[
                 "omlx_wired_limit_request_bytes"
             ],
+            "memory_guard_preview": memory_info["memory_guard_preview"],
             "ssd_total_bytes": disk_info["total_bytes"],
             "ssd_total": disk_info["total_formatted"],
         },
@@ -4694,6 +4734,8 @@ async def update_global_settings(
     runtime_applied: list[str] = []
     pending_embedding_batch_size: int | None = None
     previous_embedding_batch_size: int | None = None
+    pending_max_concurrent_requests: int | None = None
+    previous_max_concurrent_requests: int | None = None
 
     # Apply server settings
     if request.host is not None:
@@ -4753,11 +4795,33 @@ async def update_global_settings(
     if request.auto_start_on_launch is not None:
         global_settings.server.auto_start_on_launch = request.auto_start_on_launch
         runtime_applied.append("auto_start_on_launch")
+    if request.qwen4_gdn_decode_wide_proj is not None:
+        global_settings.server.qwen4_gdn_decode_wide_proj = (
+            request.qwen4_gdn_decode_wide_proj
+        )
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            pool._scheduler_config.qwen4_gdn_decode_wide_proj = (
+                request.qwen4_gdn_decode_wide_proj
+            )
+
     if request.preserve_mid_system_cache is not None:
         global_settings.server.preserve_mid_system_cache = (
             request.preserve_mid_system_cache
         )
         runtime_applied.append("preserve_mid_system_cache")
+    if request.gpu_keep_warm_interval is not None:
+        from ..server import _server_state
+
+        interval = max(0.0, float(request.gpu_keep_warm_interval))
+        global_settings.server.gpu_keep_warm_interval = interval
+        keep_warm_pool = _server_state.engine_pool
+        if keep_warm_pool is not None:
+            keep_warm_pool.configure_gpu_keep_warm(interval)
+            keep_warm_pool._ensure_gpu_keep_warm_task()
+        runtime_applied.append("gpu_keep_warm_interval")
     if request.distributed_inference_enabled is not None:
         # Route exposure and Bonjour publication are fixed at process startup,
         # so this intentionally takes effect after the normal settings restart.
@@ -4842,6 +4906,26 @@ async def update_global_settings(
         request.memory_guard_tier is not None
         or request.memory_guard_custom_ceiling_gb is not None
     ):
+        # Reject before touching live state: a custom tier without a ceiling
+        # would otherwise reach the enforcer before validate() runs below.
+        next_tier = (
+            str(request.memory_guard_tier or global_settings.memory.memory_guard_tier)
+            .strip()
+            .lower()
+        )
+        next_custom_gb = (
+            request.memory_guard_custom_ceiling_gb
+            if request.memory_guard_custom_ceiling_gb is not None
+            else global_settings.memory.memory_guard_custom_ceiling_gb
+        )
+        if next_tier == "custom" and float(next_custom_gb or 0) <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail=[
+                    "memory_guard_custom_ceiling_gb must be > 0 when "
+                    "memory_guard_tier is 'custom'"
+                ],
+            )
         if request.memory_guard_tier is not None:
             global_settings.memory.memory_guard_tier = request.memory_guard_tier
         if request.memory_guard_custom_ceiling_gb is not None:
@@ -4878,11 +4962,20 @@ async def update_global_settings(
             f"{'enabled' if request.memory_prefill_memory_guard else 'disabled'}"
         )
 
-    # Apply scheduler settings (restart required)
+    # Apply scheduler settings
     if request.max_concurrent_requests is not None:
-        global_settings.scheduler.max_concurrent_requests = (
+        if (
             request.max_concurrent_requests
-        )
+            != global_settings.scheduler.max_concurrent_requests
+        ):
+            # Applied to engines only after validate() and save() succeed.
+            previous_max_concurrent_requests = (
+                global_settings.scheduler.max_concurrent_requests
+            )
+            global_settings.scheduler.max_concurrent_requests = (
+                request.max_concurrent_requests
+            )
+            pending_max_concurrent_requests = request.max_concurrent_requests
 
     # Apply embedding batch size setting (Live for loaded embedding engines)
     if request.embedding_batch_size is not None:
@@ -5015,6 +5108,9 @@ async def update_global_settings(
     requested_storage = request.gdn_snapshot_storage
     if requested_storage is not None:
         requested_storage = requested_storage.strip().lower()
+        requested_storage = {"ssd": "ssd_sidecar", "hot": "embedded"}.get(
+            requested_storage, requested_storage
+        )
         if requested_storage not in {"auto", "ssd", "ssd_sidecar", "hot", "embedded"}:
             raise HTTPException(
                 status_code=400,
@@ -5092,46 +5188,80 @@ async def update_global_settings(
             ),
         )
     # Apply cache settings
+    # The dashboard sends all cache fields. Unchanged values must not unload engines.
     cache_changed = False
     if request.cache_enabled is not None:
-        global_settings.cache.enabled = request.cache_enabled
-        cache_changed = True
+        if request.cache_enabled != global_settings.cache.enabled:
+            global_settings.cache.enabled = request.cache_enabled
+            cache_changed = True
     if request.ssd_cache_dir is not None:
-        global_settings.cache.ssd_cache_dir = request.ssd_cache_dir
-        cache_changed = True
+        requested_cache_dir = (
+            Path(request.ssd_cache_dir).expanduser().resolve()
+            if request.ssd_cache_dir
+            else (global_settings.base_path / "cache").resolve()
+        )
+        if requested_cache_dir != global_settings.cache.get_ssd_cache_dir(
+            global_settings.base_path
+        ).resolve():
+            global_settings.cache.ssd_cache_dir = request.ssd_cache_dir
+            cache_changed = True
     if request.ssd_cache_max_size is not None:
-        global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
-        cache_changed = True
+        if request.ssd_cache_max_size != global_settings.cache.ssd_cache_max_size:
+            global_settings.cache.ssd_cache_max_size = request.ssd_cache_max_size
+            cache_changed = True
     if request.hot_cache_only is not None:
-        global_settings.cache.hot_cache_only = request.hot_cache_only
-        cache_changed = True
+        if request.hot_cache_only != global_settings.cache.hot_cache_only:
+            global_settings.cache.hot_cache_only = request.hot_cache_only
+            cache_changed = True
     if request.hot_cache_write_through is not None:
-        global_settings.cache.hot_cache_write_through = (
+        if (
             request.hot_cache_write_through
-        )
-        cache_changed = True
+            != global_settings.cache.hot_cache_write_through
+        ):
+            global_settings.cache.hot_cache_write_through = (
+                request.hot_cache_write_through
+            )
+            cache_changed = True
     if requested_storage is not None:
-        global_settings.cache.set_gdn_snapshot_storage(requested_storage)
-        cache_changed = True
+        if requested_storage != global_settings.cache.get_gdn_snapshot_storage():
+            global_settings.cache.set_gdn_snapshot_storage(requested_storage)
+            cache_changed = True
     elif request.gdn_ssd_split_enabled is not None:
-        global_settings.cache.gdn_ssd_split_enabled = request.gdn_ssd_split_enabled
-        cache_changed = True
+        if (
+            request.gdn_ssd_split_enabled
+            != global_settings.cache.gdn_ssd_split_enabled
+        ):
+            global_settings.cache.gdn_ssd_split_enabled = (
+                request.gdn_ssd_split_enabled
+            )
+            cache_changed = True
     if request.gdn_ssd_pending_max_size is not None:
-        global_settings.cache.gdn_ssd_pending_max_size = (
+        if (
             request.gdn_ssd_pending_max_size
-        )
-        cache_changed = True
+            != global_settings.cache.gdn_ssd_pending_max_size
+        ):
+            global_settings.cache.gdn_ssd_pending_max_size = (
+                request.gdn_ssd_pending_max_size
+            )
+            cache_changed = True
     if request.gdn_sidecar_precision is not None:
-        global_settings.cache.gdn_sidecar_state_dtype = (
-            request.gdn_sidecar_precision.lower()
-        )
-        cache_changed = True
+        new_sidecar_dtype = request.gdn_sidecar_precision.lower()
+        if new_sidecar_dtype != global_settings.cache.gdn_sidecar_state_dtype:
+            global_settings.cache.gdn_sidecar_state_dtype = new_sidecar_dtype
+            cache_changed = True
     if request.hot_cache_max_size is not None:
-        global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
-        cache_changed = True
+        if request.hot_cache_max_size != global_settings.cache.hot_cache_max_size:
+            global_settings.cache.hot_cache_max_size = request.hot_cache_max_size
+            cache_changed = True
     if request.initial_cache_blocks is not None:
-        global_settings.cache.initial_cache_blocks = request.initial_cache_blocks
-        cache_changed = True
+        if (
+            request.initial_cache_blocks
+            != global_settings.cache.initial_cache_blocks
+        ):
+            global_settings.cache.initial_cache_blocks = (
+                request.initial_cache_blocks
+            )
+            cache_changed = True
     # No cache_changed: reloading models cannot re-arm the native gate, which
     # reads the env var once at the first ANE compile of the process. The env
     # update covers a process that has not compiled yet; otherwise restart.
@@ -5360,6 +5490,9 @@ async def update_global_settings(
     if "integrations_pi_model" in request.model_fields_set:
         global_settings.integrations.pi_model = request.integrations_pi_model
         integrations_changed = True
+    if "integrations_dsh_model" in request.model_fields_set:
+        global_settings.integrations.dsh_model = request.integrations_dsh_model
+        integrations_changed = True
     if "integrations_openclaw_tools_profile" in request.model_fields_set:
         global_settings.integrations.openclaw_tools_profile = (
             request.integrations_openclaw_tools_profile
@@ -5562,6 +5695,10 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_max_concurrent_requests is not None:
+            global_settings.scheduler.max_concurrent_requests = (
+                previous_max_concurrent_requests
+            )
         raise HTTPException(status_code=400, detail=errors)
 
     # Persist to file
@@ -5572,7 +5709,22 @@ async def update_global_settings(
             global_settings.scheduler.embedding_batch_size = (
                 previous_embedding_batch_size
             )
+        if previous_max_concurrent_requests is not None:
+            global_settings.scheduler.max_concurrent_requests = (
+                previous_max_concurrent_requests
+            )
         raise HTTPException(status_code=500, detail=f"Failed to save settings: {e}")
+
+    if pending_max_concurrent_requests is not None:
+        from ..server import _server_state
+
+        pool = _server_state.engine_pool
+        if pool is not None:
+            await pool.apply_max_concurrent_requests(pending_max_concurrent_requests)
+        runtime_applied.append("max_concurrent_requests")
+        logger.info(
+            f"Max concurrent requests set to {pending_max_concurrent_requests} (live)"
+        )
 
     if pending_embedding_batch_size is not None:
         from ..server import _server_state
@@ -5916,6 +6068,43 @@ def _distributed_runtime_cache_stats(engine) -> dict | None:
     }
 
 
+def _scan_offline_gdn_sidecars(
+    cache_dir: Path, *, clear: bool = False
+) -> tuple[int, int]:
+    count = total_bytes = 0
+    try:
+        root_fd = os.open(
+            cache_dir / "_gdn_sidecars", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        )
+    except FileNotFoundError:
+        return count, total_bytes
+    except OSError as exc:
+        logger.warning("Could not open GDN sidecar directory: %s", exc)
+        return count, total_bytes
+
+    try:
+        # Keep deletion relative to open directories, even if a parent is replaced.
+        for _, _, files, directory_fd in os.fwalk(".", dir_fd=root_fd):
+            for name in files:
+                if not name.endswith(".safetensors"):
+                    continue
+                try:
+                    info = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode):
+                        continue
+                    if clear:
+                        os.unlink(name, dir_fd=directory_fd)
+                    count += 1
+                    total_bytes += info.st_size
+                except FileNotFoundError:
+                    continue
+                except OSError as exc:
+                    logger.warning("Could not process GDN sidecar %s: %s", name, exc)
+    finally:
+        os.close(root_fd)
+    return count, total_bytes
+
+
 def _build_runtime_cache_observability(
     global_settings,
     model_filter: str = "",
@@ -5939,8 +6128,14 @@ def _build_runtime_cache_observability(
 
     cache_dir = global_settings.cache.get_ssd_cache_dir(global_settings.base_path)
     cache_cfg = global_settings.cache
+    engine_pool = _get_engine_pool()
+    auto_size = cache_cfg.ssd_cache_max_size.lower() == "auto"
     try:
-        cfg_disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+        cfg_disk_max = (
+            0
+            if auto_size and engine_pool is not None
+            else cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+        )
     except (ValueError, OSError, TypeError) as exc:
         logger.warning("Could not read SSD cache max size from config: %s", exc)
         cfg_disk_max = 0
@@ -5959,7 +6154,6 @@ def _build_runtime_cache_observability(
         "hot_cache_entries": 0,
     }
 
-    engine_pool = _get_engine_pool()
     if engine_pool is None:
         return payload
 
@@ -6214,6 +6408,11 @@ def _build_runtime_cache_observability(
     payload["hot_cache_max_bytes"] = hot_cache_max
     payload["hot_cache_size_bytes"] = hot_cache_size_total
     payload["hot_cache_entries"] = hot_cache_entries_total
+    if auto_size and not payload["models"] and engine_pool is not None:
+        try:
+            disk_max = cache_cfg.get_ssd_cache_max_size_bytes(global_settings.base_path)
+        except (ValueError, OSError, TypeError) as exc:
+            logger.warning("Could not read automatic SSD cache limit: %s", exc)
     payload["disk_max_bytes"] = disk_max
 
     # Fallback: if no loaded models contributed stats, scan the cache
@@ -6230,8 +6429,9 @@ def _build_runtime_cache_observability(
                     for f in subdir_path.glob("*.safetensors"):
                         num_files += 1
                         total_bytes += f.stat().st_size
-            payload["total_num_files"] = num_files
-            payload["total_size_bytes"] = total_bytes
+            sidecar_count, sidecar_bytes = _scan_offline_gdn_sidecars(cache_dir)
+            payload["total_num_files"] = num_files + sidecar_count
+            payload["total_size_bytes"] = total_bytes + sidecar_bytes
         except Exception as exc:
             logger.warning("Failed to scan SSD cache directory: %s", exc)
 
@@ -6814,6 +7014,8 @@ async def clear_ssd_cache(is_admin: bool = Depends(require_admin)):
                                 total_deleted += 1
                             except OSError:
                                 pass
+                sidecar_count, _ = _scan_offline_gdn_sidecars(cache_dir, clear=True)
+                total_deleted += sidecar_count
             except Exception as exc:
                 logger.warning("Failed to clean SSD cache directory: %s", exc)
 
@@ -7973,8 +8175,11 @@ async def stream_accuracy_benchmark(
             while True:
                 async with run.cond:
                     while seen >= len(run.events) and not run.terminal:
+                        # Not wait_for: on 3.11 its child task can outlive a
+                        # client disconnect and leave run.cond unbalanced.
                         try:
-                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                            async with asyncio.timeout(60.0):
+                                await run.cond.wait()
                         except TimeoutError:
                             break
                     new = list(run.events[seen:])
@@ -8282,8 +8487,11 @@ async def stream_context_benchmark(
             while True:
                 async with run.cond:
                     while seen >= len(run.events) and not run.terminal:
+                        # Not wait_for: on 3.11 its child task can outlive a
+                        # client disconnect and leave run.cond unbalanced.
                         try:
-                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                            async with asyncio.timeout(60.0):
+                                await run.cond.wait()
                         except TimeoutError:
                             break
                     new = list(run.events[seen:])
@@ -8526,8 +8734,11 @@ async def stream_benchmark(
             while True:
                 async with run.cond:
                     while seen >= len(run.events) and not run.terminal:
+                        # Not wait_for: on 3.11 its child task can outlive a
+                        # client disconnect and leave run.cond unbalanced.
                         try:
-                            await asyncio.wait_for(run.cond.wait(), timeout=60.0)
+                            async with asyncio.timeout(60.0):
+                                await run.cond.wait()
                         except TimeoutError:
                             break
                     new = list(run.events[seen:])

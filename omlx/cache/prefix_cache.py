@@ -22,7 +22,6 @@ try:
 except ImportError:
     HAS_MLX = False
 
-from ._rotating_subclass import PrefillReadyRotatingKVCache
 from .deepseek_v41_delta import DELTA_CLASS as V41_DELTA_CLASS
 from .deepseek_v41_delta import compact_state as compact_v41_state
 from .deepseek_v41_delta import restore_chain as restore_v41_chain
@@ -107,7 +106,7 @@ _BACKFILL_CHECKED_MAX_ENTRIES = 4096
 # Lightning-MTP prompt priming has one small attention cache of its own.  The
 # normal prefix cache stores only the backbone cache, so a warm trunk restore
 # used to lose the MTP history and restart speculative decode unprimed.  Keep a
-# deliberately tiny in-memory sidecar of full-block boundary snapshots.  Four
+# deliberately tiny in-memory sidecar of cache boundary snapshots.  Four
 # entries bounds the worst-case Qwen4 100K-context footprint to roughly the
 # same order as one ordinary request cache while covering the recent branches
 # of an interactive conversation.  The entries are keyed by the *same* chain
@@ -135,6 +134,7 @@ def _wrap_cachelist_sub_marker(
         name = sub_class_names[sub_idx]
     return ("__nstate__", name, list(elements))
 _EXACT_PREFIX_TERMINAL_KEY = "specprefill-static-exact-v1"
+_EXACT_PREFIX_SPLIT_BLOCK_KEY = "specprefill-static-exact-split-v1"
 _POOLING_CACHE_SUB_CLASSES = frozenset({"PoolingCache", "BatchPoolingCache"})
 # Sentinel: the CacheList restore chain carries no PoolingCacheDelta
 # markers, so the caller restores the boundary member last-block-wins.
@@ -229,6 +229,7 @@ class BlockAwarePrefixCache(CacheManager):
         self._gdn_ssd_split_enabled = bool(gdn_ssd_split_enabled)
         self._gdn_split_fallback_reported = False
         self._gdn_checkpoint_loader: Callable[[Any], list[dict[str, Any]] | None] | None = None
+        self._exact_gdn_checkpoint_writer: Callable[..., bool] | None = None
 
         # Expected number of layers for cache validation
         self.expected_num_layers = self._get_model_num_layers(model)
@@ -247,12 +248,12 @@ class BlockAwarePrefixCache(CacheManager):
         # Request to block table mapping
         self._request_tables: dict[str, BlockCacheEntry] = {}
 
-        # Supersede-on-extend lineage for rotating (sliding-window) models:
-        # newest tip block hash -> previous tip block hash. When a chain is
-        # extended again, the entry two generations back is stripped of its
-        # rotating payload (see _strip_rotating_payload); the immediate
+        # Supersede-on-extend lineage: newest tip block hash -> previous tip
+        # block hash. When a chain is extended again, the tip two generations
+        # back is dropped: a tail is deleted, a rotating full block loses its
+        # rotating payload (see _strip_rotating_payload). The immediate
         # previous tip is kept intact as the walk-back fallback.
-        self._rotating_tip_lineage: dict[bytes, bytes] = {}
+        self._tip_lineage: dict[bytes, bytes] = {}
 
         # Hashes this session stored as tip blocks. A lineage entry is only
         # recorded when the block preceding the new blocks really was a tip:
@@ -265,6 +266,12 @@ class BlockAwarePrefixCache(CacheManager):
         # for boundary-snapshot backfill this session (real state found or
         # rewrite saved). Each hash is inspected at most once per run.
         self._backfill_checked_hashes: set[bytes] = set()
+
+        # Tails stored this session. A superseded tail is deleted, not
+        # stripped: a stripped tail is only walked back over on restore.
+        self._tail_hashes: set[bytes] = set()
+
+        self._seed_tail_index(paged_ssd_cache_manager)
 
         # Full-block Lightning-MTP prompt-history snapshots.  Values are
         # opaque to the generic prefix cache; prompt_priming owns their shape.
@@ -295,6 +302,8 @@ class BlockAwarePrefixCache(CacheManager):
         self._exact_prefix_tokens_restored = 0
         self._exact_prefix_stores = 0
         self._exact_prefix_store_failures = 0
+        self._tail_blocks_stored = 0
+        self._tail_block_hits = 0
         self._gdn_checkpoint_loads = 0
         self._gdn_checkpoint_walkbacks = 0
         self._last_gdn_restore: dict[str, Any] | None = None
@@ -308,6 +317,12 @@ class BlockAwarePrefixCache(CacheManager):
         """Attach the scheduler-owned recurrent checkpoint deserializer."""
         self._gdn_checkpoint_loader = loader
         self._gdn_dequantization_counter = dequantization_counter
+
+    def set_exact_gdn_checkpoint_writer(
+        self, writer: Callable[..., bool] | None
+    ) -> None:
+        """Attach the scheduler-owned exact-prefix checkpoint writer."""
+        self._exact_gdn_checkpoint_writer = writer
 
     def _gdn_dequantization_count(self) -> int | None:
         """Read the store counter without making restore depend on metrics."""
@@ -443,6 +458,57 @@ class BlockAwarePrefixCache(CacheManager):
             )
             return False
 
+    def _commit_exact_split_gdn_checkpoint(
+        self,
+        request_id: str,
+        token_count: int,
+        block_hash: bytes,
+        cache_data: list[Any],
+        layer_cache_types: list[str] | tuple[str, ...] | None,
+        layer_meta_states: list[Any] | None,
+    ) -> bool:
+        """Persist the final recurrent state for a domain-separated exact prefix."""
+        writer = self._exact_gdn_checkpoint_writer
+        if not callable(writer):
+            return False
+
+        recurrent_payloads = self._validated_gdn_snapshot_layers(
+            cache_data, layer_cache_types
+        )
+        if not recurrent_payloads:
+            return False
+
+        recurrent_snapshot: list[dict[str, Any]] = []
+        for layer_idx, layer_state in enumerate(cache_data):
+            if not isinstance(layer_state, dict):
+                return False
+            if layer_idx in recurrent_payloads:
+                recurrent_snapshot.append(layer_state)
+            else:
+                placeholder = dict(layer_state)
+                placeholder["state"] = ()
+                recurrent_snapshot.append(placeholder)
+
+        try:
+            return bool(
+                writer(
+                    request_id=request_id,
+                    token_count=token_count,
+                    snapshot=recurrent_snapshot,
+                    source_block_hash=block_hash,
+                    layer_cache_types=layer_cache_types,
+                    layer_meta_states=layer_meta_states,
+                    model_name=self.paged_cache.model_name,
+                    block_size=self.block_size,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Failed to commit exact-prefix GDN checkpoint for block hash %s",
+                block_hash.hex()[:16],
+            )
+            return False
+
     def _get_model_num_layers(self, model: Any) -> int:
         """
         Get the expected number of *cache layers* for validation.
@@ -506,6 +572,20 @@ class BlockAwarePrefixCache(CacheManager):
                 paged_ssd_cache_manager.invalidate_stale_layer_signature()
             except Exception as e:
                 logger.warning("Stale-signature sweep on manager attach failed: %s", e)
+            self._seed_tail_index(paged_ssd_cache_manager)
+
+    def _seed_tail_index(self, paged_ssd_cache_manager: Any) -> None:
+        """Rebuild the tail index from the SSD scan (runs from init and the setter)."""
+        seed_tails = getattr(paged_ssd_cache_manager, "iter_tail_blocks", None)
+        if not callable(seed_tails):
+            return
+        try:
+            seeded = self.paged_cache.seed_tail_blocks(seed_tails())
+        except Exception:
+            logger.exception("Failed to seed tail blocks from SSD index")
+            return
+        if seeded:
+            logger.info("Indexed %d tail blocks from SSD cache", seeded)
             logger.info("PagedSSDCacheManager connected to BlockAwarePrefixCache")
 
     def _forget_incompatible_ssd_block(
@@ -680,6 +760,8 @@ class BlockAwarePrefixCache(CacheManager):
                 num_prefix_tokens = block_table.num_tokens
                 remaining = tokens[num_prefix_tokens:]
                 self._hits += 1
+                if num_prefix_tokens % self.block_size != 0:
+                    self._tail_block_hits += 1
                 self._tokens_saved += num_prefix_tokens
                 self._tokens_matched_total += num_prefix_tokens
                 self._tokens_requested_total += len(tokens)
@@ -759,6 +841,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
         hot_cache_write_back: bool = True,
         _store_exact_terminal: bool = False,
+        _store_tail_terminal: bool = False,
     ) -> BlockTable | None:
         """
         Store computed cache for future reuse.
@@ -784,6 +867,8 @@ class BlockAwarePrefixCache(CacheManager):
             _store_exact_terminal: Internal exact-prefix mode that persists the
                 trailing partial block and isolates the terminal hash from
                 ordinary prefix matching.
+            _store_tail_terminal: Persist the trailing partial block as a tail
+                block; ``tokens`` must end on a snapshot in ``boundary_snapshots``.
 
         Returns:
             BlockTable for the stored cache, or None on failure
@@ -836,6 +921,19 @@ class BlockAwarePrefixCache(CacheManager):
         if not block_table:
             block_table = self.paged_cache.create_block_table(request_id)
 
+        # A fetched tail ends off the block grid: drop it from this table so
+        # new blocks start on the grid. It stays cached for other requests.
+        superseded_tail_hash: bytes | None = None
+        if block_table.block_ids:
+            last_block = self.paged_cache.allocated_blocks.get(
+                block_table.block_ids[-1]
+            )
+            if last_block is not None and 0 < last_block.token_count < self.block_size:
+                superseded_tail_hash = last_block.block_hash
+                block_table.block_ids.pop()
+                block_table.num_tokens -= last_block.token_count
+                self.paged_cache.release_for_eviction([last_block.block_id])
+
         # Determine tokens we need to cache (not already in block_table)
         existing_tokens = block_table.num_tokens
         new_tokens = tokens[existing_tokens:]
@@ -852,21 +950,22 @@ class BlockAwarePrefixCache(CacheManager):
         # Skipping partial blocks also ensures is_last_block points to
         # the last full block, which is critical for non-sliceable caches
         # (ArraysCache/RotatingKVCache) that use last-block-only storage.
+        store_terminal = _store_exact_terminal or _store_tail_terminal
         num_new_blocks = (
             math.ceil(len(new_tokens) / self.block_size)
-            if _store_exact_terminal
+            if store_terminal
             else len(new_tokens) // self.block_size
         )
         trailing_partial_tokens = len(new_tokens) % self.block_size
         self._last_partial_tokens_skipped = (
-            0 if _store_exact_terminal else trailing_partial_tokens
+            0 if store_terminal else trailing_partial_tokens
         )
         self._last_tokens_to_next_block = (
             self.block_size - trailing_partial_tokens
-            if trailing_partial_tokens > 0 and not _store_exact_terminal
+            if trailing_partial_tokens > 0 and not store_terminal
             else 0
         )
-        if trailing_partial_tokens > 0 and not _store_exact_terminal:
+        if trailing_partial_tokens > 0 and not store_terminal:
             self._partial_block_skips += 1
             self._partial_tokens_skipped += trailing_partial_tokens
             logger.debug(
@@ -960,6 +1059,7 @@ class BlockAwarePrefixCache(CacheManager):
         # Supersede-on-extend tracking (rotating models only, see below).
         first_new_block_idx: int | None = None
         tip_block_saved = False
+        tail_in_table = False
 
         for i in range(num_new_blocks):
             start_idx = i * self.block_size
@@ -1008,8 +1108,12 @@ class BlockAwarePrefixCache(CacheManager):
                 )
                 break
 
-            if split_gdn_layout and not callable(
-                getattr(boundary_snapshots, "commit_gdn_checkpoint", None)
+            if (
+                split_gdn_layout
+                and not _store_exact_terminal
+                and not callable(
+                    getattr(boundary_snapshots, "commit_gdn_checkpoint", None)
+                )
             ):
                 logger.warning(
                     "Stopping split-GDN prefix store for %s at %d tokens: "
@@ -1027,9 +1131,20 @@ class BlockAwarePrefixCache(CacheManager):
                 if prev_block and prev_block.block_hash:
                     parent_hash = prev_block.block_hash
 
+            is_exact_split_block = _store_exact_terminal and split_gdn_layout
             is_exact_terminal = _store_exact_terminal and i == num_new_blocks - 1
+            is_tail_terminal = (
+                _store_tail_terminal
+                and i == num_new_blocks - 1
+                and len(block_tokens) < self.block_size
+            )
             block_extra_keys: tuple[Any, ...] | None
-            if is_exact_terminal:
+            if is_exact_split_block:
+                # Isolate the whole chain. Intermediate split-GDN exact-prefix
+                # blocks carry structural recurrent placeholders and must never
+                # enter ordinary partial-prefix matching.
+                block_extra_keys = (_EXACT_PREFIX_SPLIT_BLOCK_KEY,)
+            elif is_exact_terminal:
                 block_extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,)
             else:
                 block_extra_keys = resolve_block_extra_keys(
@@ -1040,7 +1155,9 @@ class BlockAwarePrefixCache(CacheManager):
                 )
 
             # Check if this block already exists (deduplication)
-            if len(block_tokens) == self.block_size and not is_exact_terminal:
+            if (
+                len(block_tokens) == self.block_size or is_tail_terminal
+            ) and not (is_exact_terminal or is_exact_split_block):
                 existing_block = self.paged_cache.find_cached_block(
                     block_tokens,
                     parent_hash,
@@ -1073,6 +1190,7 @@ class BlockAwarePrefixCache(CacheManager):
                     # so partial-match walk-back can restore here again.
                     if (
                         not split_gdn_layout
+                        and not is_tail_terminal
                         and is_tensor_data
                         and HAS_MLX
                         and self.paged_ssd_cache is not None
@@ -1104,6 +1222,8 @@ class BlockAwarePrefixCache(CacheManager):
                     self.paged_cache.increment_ref(existing_block.block_id)
                     block_table.block_ids.append(existing_block.block_id)
                     block_table.num_tokens += len(block_tokens)
+                    if is_tail_terminal:
+                        tail_in_table = True
                     continue
 
             # Allocate new block
@@ -1138,15 +1258,22 @@ class BlockAwarePrefixCache(CacheManager):
                 model_name=self.paged_cache.model_name,
             )
 
-            # Register ordinary full blocks for general prefix matching. The
-            # exact terminal uses a separate hash domain so it can carry the
-            # complete non-sliceable state without colliding with a normal
-            # block that may contain placeholders.
-            if len(block_tokens) == self.block_size and not is_exact_terminal:
+            # Split-GDN exact-prefix blocks use a separate hash domain and are
+            # reachable only through fetch_exact_prefix(). Full-attention
+            # exact-prefix blocks retain ordinary reuse before their isolated
+            # terminal block.
+            if (
+                len(block_tokens) == self.block_size
+                and not is_exact_terminal
+                and not is_exact_split_block
+            ):
                 self.paged_cache.register_block_hash(
                     block, block_tokens, parent_hash, extra_keys=block_extra_keys
                 )
-            elif is_exact_terminal and block.block_hash is not None:
+            elif (
+                is_exact_terminal or is_exact_split_block or is_tail_terminal
+            ) and block.block_hash is not None:
+                # Tail blocks join the parent-keyed tail index once saved.
                 self.paged_cache.cached_block_hash_to_block.insert(
                     block.block_hash, block
                 )
@@ -1193,7 +1320,7 @@ class BlockAwarePrefixCache(CacheManager):
                 # last FULL block otherwise may sit behind skipped trailing
                 # tokens the live state has already ingested -- see A1.
                 live_state_at_true_end = is_last_block and (
-                    _store_exact_terminal or trailing_partial_tokens == 0
+                    store_terminal or trailing_partial_tokens == 0
                 )
 
                 # Continuity check applies only when we will slice live
@@ -1296,6 +1423,8 @@ class BlockAwarePrefixCache(CacheManager):
                             layer_cache_types=layer_cache_types,
                             layer_meta_states=block_meta,
                             replace_existing=False,
+                            parent_hash=parent_hash,
+                            tail_terminal=is_tail_terminal,
                         )
                     else:
                         saved = self.paged_ssd_cache.save_block(
@@ -1307,18 +1436,33 @@ class BlockAwarePrefixCache(CacheManager):
                             layer_meta_states=block_meta,
                             hot_cache_write_back=False,
                             replace_existing=False,
+                            parent_hash=parent_hash,
+                            tail_terminal=is_tail_terminal,
                         )
                     if saved:
                         if split_gdn_layout:
-                            checkpoint_committed = (
-                                self._commit_split_gdn_checkpoint(
-                                    boundary_snapshots,
-                                    block_boundary_tc,
-                                    block.block_hash,
-                                    layer_cache_types,
-                                    layer_meta_states,
+                            if is_exact_split_block:
+                                checkpoint_committed = (
+                                    not is_exact_terminal
+                                    or self._commit_exact_split_gdn_checkpoint(
+                                        request_id,
+                                        block_boundary_tc,
+                                        block.block_hash,
+                                        cache_data,
+                                        layer_cache_types,
+                                        layer_meta_states,
+                                    )
                                 )
-                            )
+                            else:
+                                checkpoint_committed = (
+                                    self._commit_split_gdn_checkpoint(
+                                        boundary_snapshots,
+                                        block_boundary_tc,
+                                        block.block_hash,
+                                        layer_cache_types,
+                                        layer_meta_states,
+                                    )
+                                )
                             if not checkpoint_committed:
                                 logger.warning(
                                     "Rejecting split-GDN placeholder block %s "
@@ -1361,6 +1505,15 @@ class BlockAwarePrefixCache(CacheManager):
                         blocks_saved_to_ssd += 1
                         if is_last_block:
                             tip_block_saved = True
+                        if is_tail_terminal:
+                            self.paged_cache.register_tail_block(
+                                parent_hash, block.block_hash, len(block_tokens)
+                            )
+                            self._tail_hashes.add(block.block_hash)
+                            if len(self._tail_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
+                                self._tail_hashes.clear()
+                            self._tail_blocks_stored += 1
+                            tail_in_table = True
                         logger.debug(
                             f"Saved block {block.block_id} to tiered cache: "
                             f"tokens [{global_start}:{global_end}], {len(block_kv_data)} layers"
@@ -1386,29 +1539,34 @@ class BlockAwarePrefixCache(CacheManager):
                     block_table.num_tokens -= len(block_tokens)
                     break
 
-        # Supersede-on-extend: on rotating (sliding-window) models every store
-        # of a growing conversation writes one tip block carrying the full
-        # sliding-window state of all rotating layers (hundreds of MB fp16 on
-        # a gemma3-class model). Restore only ever consumes the newest such
-        # block, and the immediate previous tip is kept intact as the
-        # walk-back fallback — so the tip two generations back is dead
-        # weight. Without stripping it, those blocks fill the hot cache after
+        # Supersede-on-extend: every store of a growing conversation writes one
+        # heavy tip block. On rotating (sliding-window) models it carries the
+        # full sliding-window state (hundreds of MB fp16 on a gemma3-class
+        # model), and a tail tip carries every non-sliceable layer state, such
+        # as hybrid recurrent state. Restore only ever consumes the newest such
+        # block, and the immediate previous tip is kept intact as the walk-back
+        # and edited-turn fallback, so the tip two generations back is dead
+        # weight. Without dropping it, those blocks fill the hot cache after
         # ~10-20 turns and LRU eviction breaks the prefix chain (multi-turn
-        # cache hit collapses to 0%). Steady state after stripping: two heavy
-        # blocks per chain.
+        # cache hit collapses to 0%). Steady state: two heavy blocks per chain.
+        # Non-rotating layouts track tail tips only.
+        rotating_layout = bool(layer_cache_types) and any(
+            CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types
+        )
         if (
             tip_block_saved
             and first_new_block_idx is not None
             and first_new_block_idx < len(block_table.block_ids)
-            and layer_cache_types
-            and any(CacheTypeRegistry.is_rotating_family(t) for t in layer_cache_types)
+            and (rotating_layout or tail_in_table)
         ):
             new_tip_id = block_table.block_ids[-1]
             new_tip = self.paged_cache.allocated_blocks.get(new_tip_id)
-            prev_tip = None
-            if first_new_block_idx > 0:
+            prev_tip_hash: bytes | None = superseded_tail_hash
+            if prev_tip_hash is None and first_new_block_idx > 0:
                 prev_tip_id = block_table.block_ids[first_new_block_idx - 1]
                 prev_tip = self.paged_cache.allocated_blocks.get(prev_tip_id)
+                if prev_tip is not None:
+                    prev_tip_hash = prev_tip.block_hash
             if new_tip is not None and new_tip.block_hash is not None:
                 # Only treat prev as a superseded tip when it actually was
                 # one. `first_new_block_idx - 1` is merely the last reused
@@ -1418,30 +1576,31 @@ class BlockAwarePrefixCache(CacheManager):
                 # it stripped two stores later, permanently breaking
                 # partial-match walk-back restores.
                 if (
-                    prev_tip is not None
-                    and prev_tip.block_hash is not None
-                    and prev_tip.block_hash in self._store_tip_hashes
+                    prev_tip_hash is not None
+                    and prev_tip_hash in self._store_tip_hashes
                 ):
-                    superseded = self._rotating_tip_lineage.pop(
-                        prev_tip.block_hash, None
-                    )
+                    superseded = self._tip_lineage.pop(prev_tip_hash, None)
                     if superseded is not None:
-                        self._strip_rotating_payload(superseded)
-                    self._rotating_tip_lineage[new_tip.block_hash] = (
-                        prev_tip.block_hash
-                    )
-                    if len(self._rotating_tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
-                        self._rotating_tip_lineage.clear()
+                        if superseded in self._tail_hashes:
+                            self._discard_tail_block(superseded, layer_cache_types)
+                        elif rotating_layout:
+                            self._strip_rotating_payload(superseded)
+                    self._tip_lineage[new_tip.block_hash] = prev_tip_hash
+                    if len(self._tip_lineage) > _TIP_LINEAGE_MAX_ENTRIES:
+                        self._tip_lineage.clear()
                 self._store_tip_hashes.add(new_tip.block_hash)
                 if len(self._store_tip_hashes) > _TIP_LINEAGE_MAX_ENTRIES:
                     self._store_tip_hashes.clear()
 
         # Exact terminal blocks are discoverable only through
         # fetch_exact_prefix(); never expose them to general prefix matching.
+        # A tail block is reached through the tail index, so index only the
+        # full blocks in front of it.
         if not _store_exact_terminal:
-            self._update_prefix_index(
-                tokens, block_table.block_ids, extra_keys=extra_keys
+            indexed_ids = (
+                block_table.block_ids[:-1] if tail_in_table else block_table.block_ids
             )
+            self._update_prefix_index(tokens, indexed_ids, extra_keys=extra_keys)
 
         # Store entry for request tracking
         self._request_tables[request_id] = BlockCacheEntry(
@@ -1466,22 +1625,20 @@ class BlockAwarePrefixCache(CacheManager):
     ) -> BlockTable | None:
         """Persist a complete prefix, including its exact terminal boundary.
 
-        Ordinary prefix matching remains full-block-only. This path stores one
-        domain-separated terminal block, excludes it from general matching,
-        and restores it only when the complete static-prefix token chain
-        matches. That captures an arbitrary system/tool boundary without
-        making the target model repeatedly prefill its uncached suffix.
-        SSD-backed configurations use write-through so the hot tier is never
-        the only durable copy.
+        The terminal boundary is restored only when every static-prefix token
+        matches. SSD-backed configurations use write-through so the hot tier is
+        never the only durable copy. Split-GDN layouts domain-separate the whole
+        chain and store one recurrent sidecar at the exact terminal; preceding
+        blocks contain only KV slices and structural recurrent placeholders.
         """
         if not tokens or self.paged_ssd_cache is None:
             return None
 
-        # Exact-prefix storage has no boundary-snapshot provider to commit
-        # the recurrent state. Refuse split-GDN entries before store_cache()
-        # allocates a terminal block; otherwise the terminal would contain
-        # only the structural ArraysCache placeholder and could never be
-        # reconstructed.
+        # Exact-prefix storage has no prefill-boundary provider. Split-GDN
+        # layouts can still persist safely when the scheduler supplies a writer:
+        # the full static prefix has just been evaluated, so its terminal
+        # recurrent state is exact. Intermediate blocks stay domain-separated
+        # and need no recurrent checkpoints.
         exact_layer_cache_types = None
         if model_cache_config:
             exact_layer_cache_types = model_cache_config.get_type_names()
@@ -1501,10 +1658,12 @@ class BlockAwarePrefixCache(CacheManager):
                 )
                 for layer_state in cache_data
             ]
-        if self._gdn_split_layout_supported(exact_layer_cache_types):
+        if self._gdn_split_layout_supported(exact_layer_cache_types) and not callable(
+            self._exact_gdn_checkpoint_writer
+        ):
             logger.info(
                 "Skipping exact-prefix store for %s: split-GDN terminal "
-                "sidecar commit is unavailable",
+                "sidecar writer is unavailable",
                 request_id,
             )
             self._exact_prefix_store_failures += 1
@@ -1534,16 +1693,23 @@ class BlockAwarePrefixCache(CacheManager):
         return stored_table
 
     def _exact_prefix_hashes(self, tokens: list[int]) -> list[tuple[BlockHash, int]]:
-        """Return deterministic block hashes and token counts for an exact prefix."""
+        """Return deterministic hashes for an exact prefix."""
         block_hashes_and_token_counts: list[tuple[BlockHash, int]] = []
         parent_hash: BlockHash | None = None
         terminal_start = ((len(tokens) - 1) // self.block_size) * self.block_size
+        expected_layer_types = getattr(
+            self.paged_ssd_cache, "_expected_layer_cache_types", None
+        )
+        split_gdn_layout = self._gdn_split_layout_supported(expected_layer_types)
 
         for block_start in range(0, len(tokens), self.block_size):
             block_tokens = tokens[block_start : block_start + self.block_size]
-            extra_keys = (
-                (_EXACT_PREFIX_TERMINAL_KEY,) if block_start == terminal_start else None
-            )
+            if split_gdn_layout:
+                extra_keys = (_EXACT_PREFIX_SPLIT_BLOCK_KEY,)
+            elif block_start == terminal_start:
+                extra_keys = (_EXACT_PREFIX_TERMINAL_KEY,)
+            else:
+                extra_keys = None
             block_hash = compute_block_hash(
                 parent_hash,
                 block_tokens,
@@ -1836,6 +2002,44 @@ class BlockAwarePrefixCache(CacheManager):
                             return seq_len
 
         return 0
+
+    def _discard_tail_block(
+        self,
+        block_hash: bytes,
+        layer_cache_types: list[str] | None = None,
+    ) -> bool:
+        """Drop a superseded tail from every tier when no request holds it.
+
+        The hash leaves the hot map under the lock before the payload goes.
+        """
+        with self.paged_cache._lock:
+            block = self.paged_cache.cached_block_hash_to_block.get_block(block_hash)
+            if block is not None:
+                if block.ref_count > 0:
+                    return False
+                # A cold-registered metadata block sits at ref 0; free_block
+                # takes it below zero and returns it to the pool.
+                self.paged_cache.free_block(block.block_id)
+        if self.paged_ssd_cache is not None:
+            try:
+                self.paged_ssd_cache.delete_block(block_hash)
+                # A split-GDN tail keeps its recurrent state in a sidecar.
+                if self._gdn_split_layout_supported(layer_cache_types):
+                    self.paged_ssd_cache.forget_gdn_checkpoint(
+                        block_hash,
+                        self.paged_ssd_cache.gdn_cache_signature_for(
+                            model_name=self.paged_cache.model_name,
+                            num_layers=len(layer_cache_types),
+                            block_size=self.block_size,
+                            layer_cache_types=layer_cache_types,
+                        ),
+                    )
+            except Exception:
+                logger.exception(
+                    "Failed to delete superseded tail block %s", block_hash.hex()[:16]
+                )
+        self._tail_hashes.discard(block_hash)
+        return True
 
     def _strip_rotating_payload(self, block_hash: bytes) -> bool:
         """Replace a superseded tip block's rotating payload with placeholders.
@@ -4595,99 +4799,6 @@ class BlockAwarePrefixCache(CacheManager):
             logger.debug(f"Fallback reconstruction failed: {e}")
             return None
 
-    def _find_kv_shape_ref(
-        self,
-        all_block_data: list[list[tuple[Any, Any]]],
-        layer_cache_types: list[str] | None = None,
-    ) -> tuple[int, int] | None:
-        """Find (kv_heads, head_dim) from a KVCache layer's stored data.
-
-        Used to create zero-length RotatingKVCache tensors with the correct shape.
-
-        Args:
-            all_block_data: All loaded block data
-            layer_cache_types: Per-layer cache type names
-
-        Returns:
-            (kv_heads, head_dim) tuple, or None if not found
-        """
-        if not all_block_data:
-            return None
-
-        for layer_idx, layer_data in enumerate(all_block_data[0]):
-            # Skip non-KVCache layers
-            if layer_cache_types and layer_idx < len(layer_cache_types):
-                if layer_cache_types[layer_idx] != "KVCache":
-                    continue
-            # Guard against non-tuple formats (CacheList stores List[Tuple])
-            if not isinstance(layer_data, tuple) or len(layer_data) != 2:
-                continue
-            keys, _ = layer_data
-            if hasattr(keys, "shape") and len(keys.shape) == 4:
-                return (keys.shape[1], keys.shape[3])
-
-        return None
-
-    def _create_empty_rotating_cache(
-        self,
-        meta_state: tuple | None = None,
-        kvcache_offset: int = 0,
-        kv_shape_ref: tuple[int, int] | None = None,
-    ) -> Any | None:
-        """
-        Create an empty RotatingKVCache for partial prefix restore.
-
-        Creates a RotatingKVCache with zero-length keys/values (not None) and
-        offset matching the KVCache layers. This ensures:
-        1. mlx-lm's empty() returns False → Continuation mode (not Fresh Start)
-        2. Position IDs (RoPE) are correct for all layers
-        3. The merge creates a zero-length buffer (not zero-filled) so that
-           no phantom attention positions exist during window padding reprocessing
-
-        Uses PrefillReadyRotatingKVCache (clamped size() by buffer length)
-        so BatchRotatingKVCache.merge() never reads beyond the actual buffer
-        and never sees zero-padded positions as valid attention keys.
-
-        Args:
-            meta_state: RotatingKVCache meta_state tuple (keep, max_size, offset, _idx).
-            kvcache_offset: Offset to match KVCache layers (= restored token count).
-            kv_shape_ref: (kv_heads, head_dim) from a KVCache layer for tensor shape.
-
-        Returns:
-            RotatingKVCache with zero-length keys/values, or None on failure.
-        """
-        if meta_state and len(meta_state) >= 2:
-            keep = int(meta_state[0])
-            max_size = int(meta_state[1])
-        else:
-            logger.warning(
-                "Cannot create empty RotatingKVCache: meta_state missing or incomplete"
-            )
-            return None
-
-        cache = PrefillReadyRotatingKVCache(max_size=max_size, keep=keep)
-        cache.offset = kvcache_offset
-
-        # Set zero-length keys/values so empty() returns False.
-        # This prevents mlx-lm from entering Fresh Start mode which
-        # would discard all cached KVCache data.
-        if kv_shape_ref and HAS_MLX:
-            kv_heads, head_dim = kv_shape_ref
-            cache.keys = mx.zeros((1, kv_heads, 0, head_dim))
-            cache.values = mx.zeros((1, kv_heads, 0, head_dim))
-            cache._idx = 0
-            logger.debug(
-                f"Created empty RotatingKVCache: max_size={max_size}, keep={keep}, "
-                f"offset={kvcache_offset}, kv_heads={kv_heads}, head_dim={head_dim}"
-            )
-        else:
-            logger.debug(
-                f"Created empty RotatingKVCache: max_size={max_size}, keep={keep} "
-                f"(no shape ref, keys=None)"
-            )
-
-        return cache
-
     def _validate_block_cache_data(
         self,
         cache_data: list[tuple[Any, Any]],
@@ -4920,7 +5031,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
     ) -> bytes | None:
-        """Return the ordinary full-block chain hash for an MTP sidecar.
+        """Return the backbone chain hash, including a terminal tail, for an MTP sidecar.
 
         VLM requests can change hidden states without changing token ids.  The
         generic prefix cache supports per-range media keys, but
@@ -4932,7 +5043,6 @@ class BlockAwarePrefixCache(CacheManager):
         if (
             boundary_tokens <= 0
             or boundary_tokens > len(tokens)
-            or boundary_tokens % self.block_size != 0
             or extra_key_token_start is not None
             or extra_key_ranges is not None
         ):
@@ -4941,7 +5051,7 @@ class BlockAwarePrefixCache(CacheManager):
         for start in range(0, boundary_tokens, self.block_size):
             parent_hash = compute_block_hash(
                 parent_hash,
-                tokens[start : start + self.block_size],
+                tokens[start : min(start + self.block_size, boundary_tokens)],
                 extra_keys=extra_keys,
                 model_name=self.paged_cache.model_name,
             )
@@ -4957,7 +5067,7 @@ class BlockAwarePrefixCache(CacheManager):
         extra_key_token_start: int | None = None,
         extra_key_ranges: list[tuple[int, tuple[Any, ...]]] | None = None,
     ) -> bool:
-        """Keep an exact Lightning-MTP history at one backbone block boundary.
+        """Keep an exact Lightning-MTP history at one backbone cache boundary.
 
         This is intentionally memory-only.  SSD persistence would require a
         versioned serialization contract for every model family's MTP cache;
@@ -5034,6 +5144,8 @@ class BlockAwarePrefixCache(CacheManager):
             exact_prefix_tokens_restored=self._exact_prefix_tokens_restored,
             exact_prefix_stores=self._exact_prefix_stores,
             exact_prefix_store_failures=self._exact_prefix_store_failures,
+            tail_blocks_stored=self._tail_blocks_stored,
+            tail_block_hits=self._tail_block_hits,
         )
 
     def get_stats_dict(self) -> dict[str, Any]:
@@ -5067,6 +5179,8 @@ class BlockAwarePrefixCache(CacheManager):
             "exact_prefix_tokens_restored": self._exact_prefix_tokens_restored,
             "exact_prefix_stores": self._exact_prefix_stores,
             "exact_prefix_store_failures": self._exact_prefix_store_failures,
+            "tail_blocks_stored": self._tail_blocks_stored,
+            "tail_block_hits": self._tail_block_hits,
             "gdn_checkpoint_loads": self._gdn_checkpoint_loads,
             "gdn_checkpoint_walkbacks": self._gdn_checkpoint_walkbacks,
             "gdn_last_restore": (
@@ -5094,6 +5208,8 @@ class BlockAwarePrefixCache(CacheManager):
         self._exact_prefix_tokens_restored = 0
         self._exact_prefix_stores = 0
         self._exact_prefix_store_failures = 0
+        self._tail_blocks_stored = 0
+        self._tail_block_hits = 0
         self._gdn_checkpoint_loads = 0
         self._gdn_checkpoint_walkbacks = 0
         self._last_gdn_restore = None

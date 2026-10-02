@@ -379,6 +379,24 @@ async def verify_api_key(
     return True
 
 
+def allows_unauthenticated_inference() -> bool:
+    settings = _server_state.global_settings
+    return (
+        settings is not None
+        and settings.auth.allow_unauthenticated_inference is True
+    )
+
+
+async def verify_inference_api_key(
+    request: FastAPIRequest,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> bool:
+    """Allow the manual inference opt-in without changing management auth."""
+    if allows_unauthenticated_inference():
+        return True
+    return await verify_api_key(request, credentials)
+
+
 def distributed_inference_enabled() -> bool:
     """Whether the experimental distributed surface is exposed this run."""
 
@@ -648,6 +666,18 @@ async def lifespan(app: FastAPI):
     if mcp_config:
         await init_mcp(mcp_config)
 
+    # Resume persisted download queues after settings and model dirs are set.
+    if _server_state.hf_downloader is not None:
+        try:
+            await _server_state.hf_downloader.restore_tasks()
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("HF download queue restore failed: %s", exc)
+    if _server_state.ms_downloader is not None:
+        try:
+            await _server_state.ms_downloader.restore_tasks()
+        except Exception as exc:  # pragma: no cover - never block startup
+            logger.warning("MS download queue restore failed: %s", exc)
+
     yield
 
     # Shutdown: Save all-time stats, stop TTL task, process memory enforcer, etc.
@@ -710,14 +740,14 @@ from .api.mcp_routes import router as mcp_router
 from .api.mcp_routes import set_mcp_manager_getter
 
 set_mcp_manager_getter(get_mcp_manager)
-app.include_router(mcp_router, dependencies=[Depends(verify_api_key)])
+app.include_router(mcp_router, dependencies=[Depends(verify_inference_api_key)])
 
 # Include web search routes (chat UI built-in web_search / fetch_url tools)
 from .api.websearch_routes import router as websearch_router
 from .api.websearch_routes import set_global_settings_getter as _set_websearch_settings
 
 _set_websearch_settings(lambda: _server_state.global_settings)
-app.include_router(websearch_router, dependencies=[Depends(verify_api_key)])
+app.include_router(websearch_router, dependencies=[Depends(verify_inference_api_key)])
 
 # Include audio routes only when mlx-audio is installed.
 # audio_routes.py itself only imports fastapi/stdlib at module level, so it
@@ -728,9 +758,9 @@ try:
     from .api.audio_routes import realtime_router as audio_realtime_router
     from .api.audio_routes import router as audio_router
 
-    app.include_router(audio_router, dependencies=[Depends(verify_api_key)])
+    app.include_router(audio_router, dependencies=[Depends(verify_inference_api_key)])
     # The realtime WebSocket router authenticates in-band (first message):
-    # verify_api_key is an HTTP-only dependency and browsers cannot set an
+    # HTTP auth dependencies cannot resolve WebSocket scopes, and browsers cannot set an
     # Authorization header on WebSocket connections.
     app.include_router(audio_realtime_router)
     del _
@@ -1992,6 +2022,38 @@ def _resolve_metric_durations(
     return prefill_duration, generation_duration
 
 
+def _usage_timing_fields(
+    prompt_tokens: int,
+    completion_tokens: int,
+    *,
+    ttft: float | None,
+    prefill_duration: float,
+    generation_duration: float,
+    cached_tokens: int = 0,
+) -> dict:
+    """Timing fields for a non-streaming Usage, computed like the final streaming chunk.
+
+    The prompt rate counts only the tokens prefilled in this request: cached
+    prefix tokens were restored, not computed, during prefill_duration.
+    """
+    computed = max(prompt_tokens - (cached_tokens or 0), 0)
+    return {
+        "time_to_first_token": round(ttft, 2) if ttft is not None else None,
+        "prompt_eval_duration": (
+            round(prefill_duration, 2) if prefill_duration > 0 else None
+        ),
+        "generation_duration": round(generation_duration, 2),
+        "prompt_tokens_per_second": (
+            round(computed / prefill_duration, 2) if prefill_duration > 0 else None
+        ),
+        "generation_tokens_per_second": (
+            round(completion_tokens / generation_duration, 2)
+            if generation_duration > 0
+            else None
+        ),
+    }
+
+
 def _get_ocr_defaults(model_id: str | None) -> dict | None:
     """Get OCR generation defaults for a model, or None if not an OCR model."""
     if model_id is None:
@@ -2138,12 +2200,23 @@ def init_server(
         if auth_error:
             raise ValueError(auth_error)
 
+    if global_settings is not None:
+        global_settings.ensure_inference_auth_setting()
+
     # Store API key
     _server_state.api_key = api_key
     _server_state.global_settings = global_settings
     _server_state.bind_host = (
         global_settings.server.host if global_settings is not None else None
     )
+    if allows_unauthenticated_inference():
+        logger.warning(
+            "Unauthenticated inference is enabled on %s. Anyone who can connect "
+            "can use inference, stored Responses, audio, MCP tools, and web "
+            "search/fetch. Management endpoints still require authentication "
+            "on non-loopback binds.",
+            _server_state.bind_host,
+        )
     from .cluster.exposure import distributed_inference_enabled as is_enabled
 
     _server_state.distributed_inference_enabled = is_enabled(global_settings)
@@ -2231,9 +2304,13 @@ def init_server(
     _server_state.engine_pool = EnginePool(
         scheduler_config=scheduler_config,
     )
+    _server_state.engine_pool.configure_gpu_keep_warm(
+        global_settings.server.gpu_keep_warm_interval if global_settings else 0.5
+    )
     from .cluster.enrollment import configure_cluster_enrollment, get_cluster_enrollment
     from .cluster.incidents import configure_cluster_incidents
     from .cluster.pairing import configure_pairing_manager
+    from .cluster.rdma.store import configure_rdma_link_store
     from .cluster.registry import (
         configure_cluster_registry,
         configure_device_registry,
@@ -2243,6 +2320,7 @@ def init_server(
 
     _server_state.engine_pool._cluster_registry = configure_cluster_registry(base_path)
     configure_cluster_enrollment(base_path)
+    configure_rdma_link_store(base_path)
     configure_cluster_incidents(base_path)
     configure_strategy_benchmark_store(base_path)
     # Cluster v2: stable node identity + trusted device inventory. Best
@@ -2329,6 +2407,13 @@ def init_server(
     # Initialize HuggingFace downloader
     from .admin.hf_downloader import HFDownloader
     from .admin.routes import set_hf_downloader
+    from .settings import resolve_default_base_path
+
+    tasks_base = (
+        Path(global_settings.base_path)
+        if global_settings is not None
+        else resolve_default_base_path()
+    )
 
     async def _refresh_models_after_download():
         """Re-discover models when a HuggingFace download completes."""
@@ -2343,6 +2428,7 @@ def init_server(
     _server_state.hf_downloader = HFDownloader(
         model_dir=dir_list[0],  # Downloads go to primary directory
         on_complete=_refresh_models_after_download,
+        tasks_file=tasks_base / "hf_download_tasks.json",
     )
     set_hf_downloader(_server_state.hf_downloader)
     logger.info("HF Downloader initialized")
@@ -2357,6 +2443,7 @@ def init_server(
             _server_state.ms_downloader = MSDownloader(
                 model_dir=dir_list[0],
                 on_complete=_refresh_models_after_download,
+                tasks_file=tasks_base / "ms_download_tasks.json",
             )
             set_ms_downloader(_server_state.ms_downloader)
             logger.info("ModelScope Downloader initialized")
@@ -3245,7 +3332,7 @@ async def _create_markitdown_chat_completion(
 
 
 @app.get("/v1/models")
-async def list_models(_: bool = Depends(verify_api_key)) -> ModelsResponse:
+async def list_models(_: bool = Depends(verify_inference_api_key)) -> ModelsResponse:
     """List all available models with load status."""
     models = []
     favorite_ids: set[str] = set()
@@ -3469,7 +3556,7 @@ async def load_model_public(model_id: str, _: bool = Depends(verify_api_key)):
 async def create_embeddings(
     request: EmbeddingRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create embeddings for input text(s).
@@ -3616,7 +3703,7 @@ def normalize_documents(documents: list[str] | list[dict]) -> list[str]:
 @app.post("/v1/rerank")
 async def create_rerank(
     request: RerankRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ) -> RerankResponse:
     """
     Rerank documents by relevance to a query.
@@ -3722,7 +3809,7 @@ async def create_rerank(
 async def create_completion(
     request: CompletionRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Create a text completion."""
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
@@ -3884,11 +3971,12 @@ async def create_completion(
                 f"({tokens_per_sec:.1f} tok/s), prompt: {total_prompt_tokens}"
             )
 
-            prefill_duration = (
+            ttft = (
                 (first_token_at - start_time)
                 if first_token_at is not None
-                else 0.0
+                else None
             )
+            prefill_duration = ttft if ttft is not None else 0.0
             gen_duration = elapsed - prefill_duration if prefill_duration > 0 else elapsed
             get_server_metrics().record_request_complete(
                 prompt_tokens=total_prompt_tokens,
@@ -3916,6 +4004,18 @@ async def create_completion(
                         else None
                     ),
                     total_time=round(elapsed, 2),
+                    **(
+                        _usage_timing_fields(
+                            total_prompt_tokens,
+                            total_completion_tokens,
+                            ttft=ttft,
+                            prefill_duration=prefill_duration,
+                            generation_duration=gen_duration,
+                            cached_tokens=total_cached_tokens,
+                        )
+                        if len(prompts) == 1
+                        else {}
+                    ),
                 ),
             ).model_dump_json(exclude_none=True)
 
@@ -3931,7 +4031,7 @@ async def create_completion(
 async def create_chat_completion(
     request: ChatCompletionRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create a chat completion.
@@ -4377,13 +4477,16 @@ async def create_chat_completion(
             ttft = (
                 (first_token_at - start_time)
                 if first_token_at is not None
-                else 0.0
+                else None
             )
-            gen_duration = elapsed - ttft if ttft > 0 else elapsed
+            metric_prefill = ttft if ttft is not None else 0.0
+            gen_duration = (
+                elapsed - metric_prefill if metric_prefill > 0 else elapsed
+            )
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
                 output,
                 is_diffusion=is_diffusion,
-                prefill_duration=ttft,
+                prefill_duration=metric_prefill,
                 generation_duration=gen_duration,
             )
 
@@ -4399,7 +4502,9 @@ async def create_chat_completion(
 
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
             )
@@ -4472,6 +4577,14 @@ async def create_chat_completion(
                         else None
                     ),
                     total_time=round(elapsed, 2),
+                    **_usage_timing_fields(
+                        output.prompt_tokens,
+                        output.completion_tokens,
+                        ttft=ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=output.cached_tokens,
+                    ),
                 ),
             ).model_dump_json(exclude_none=True)
 
@@ -4702,6 +4815,9 @@ def _compile_with_structural_tag(
     return compiler.compile_structural_tag(tag_dict)
 
 
+_JSON_SCHEMA_MAX_WHITESPACE_CNT = 32
+
+
 def _compile_bare_grammar(compiler, fmt: dict):
     """Compile a grammar without any structural tag wrapping."""
     if fmt["type"] == "json_schema":
@@ -4711,7 +4827,15 @@ def _compile_bare_grammar(compiler, fmt: dict):
         if not schema:
             return compiler.compile_builtin_json_grammar()
         schema_str = _json.dumps(schema) if isinstance(schema, dict) else schema
-        return compiler.compile_json_schema(schema_str)
+        # An unlimited whitespace run can trap a grammar-constrained decoder
+        # after an early string termination: whitespace remains valid while
+        # every useful token is masked.  Keep the bound local to the compiler
+        # call so ordinary JSON and user-supplied EBNF/regex grammars retain
+        # their existing behavior.
+        return compiler.compile_json_schema(
+            schema_str,
+            max_whitespace_cnt=_JSON_SCHEMA_MAX_WHITESPACE_CNT,
+        )
     elif fmt["type"] == "grammar":
         return compiler.compile_grammar(fmt["grammar"])
     elif fmt["type"] == "regex":
@@ -5068,19 +5192,14 @@ async def stream_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
-                    time_to_first_token=round(ttft, 2),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(metric_prefill_duration, 2),
-                    generation_duration=round(metric_gen_duration, 2),
-                    prompt_tokens_per_second=(
-                        round(pt / metric_prefill_duration, 2)
-                        if metric_prefill_duration > 0
-                        else None
-                    ),
-                    generation_tokens_per_second=(
-                        round(ct / metric_gen_duration, 2)
-                        if metric_gen_duration > 0
-                        else None
+                    **_usage_timing_fields(
+                        pt,
+                        ct,
+                        ttft=ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=last_output.cached_tokens,
                     ),
                 ).model_dump(exclude_none=True),
             }
@@ -5531,7 +5650,9 @@ async def stream_chat_completion(
 
     # Flush remaining buffered content from thinking/tool-call parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=last_output is not None and last_output.finish_reason == "length"
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -5616,7 +5737,10 @@ async def stream_chat_completion(
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
         # (falls back to thinking content for small models)
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -5896,26 +6020,19 @@ async def stream_chat_completion(
                         if model_load_duration > 1.0
                         else None
                     ),
-                    time_to_first_token=(
-                        round(model_ttft, 2) if model_ttft is not None else None
-                    ),
                     time_to_first_visible_token=(
                         round(visible_ttft, 2)
                         if visible_ttft is not None
                         else None
                     ),
                     total_time=round(total_time, 2),
-                    prompt_eval_duration=round(metric_prefill_duration, 2),
-                    generation_duration=round(metric_gen_duration, 2),
-                    prompt_tokens_per_second=(
-                        round(pt / metric_prefill_duration, 2)
-                        if metric_prefill_duration > 0
-                        else None
-                    ),
-                    generation_tokens_per_second=(
-                        round(ct / metric_gen_duration, 2)
-                        if metric_gen_duration > 0
-                        else None
+                    **_usage_timing_fields(
+                        pt,
+                        ct,
+                        ttft=model_ttft,
+                        prefill_duration=metric_prefill_duration,
+                        generation_duration=metric_gen_duration,
+                        cached_tokens=last_output.cached_tokens,
                     ),
                 ),
             )
@@ -6130,7 +6247,9 @@ async def stream_anthropic_messages(
         await _aclose_async_iterator(engine_stream)
 
     # Flush remaining buffered content from thinking parser
-    thinking_delta, content_delta = thinking_parser.finish()
+    thinking_delta, content_delta = thinking_parser.finish(
+        truncated=last_output is not None and last_output.finish_reason == "length"
+    )
     if thinking_delta:
         if thinking_filter:
             thinking_delta = thinking_filter.feed(thinking_delta)
@@ -6211,7 +6330,10 @@ async def stream_anthropic_messages(
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
         # (falls back to thinking content for small models)
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -6372,7 +6494,7 @@ async def stream_anthropic_messages(
 async def create_anthropic_message(
     request: AnthropicMessagesRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Create a message using Anthropic Messages API format.
@@ -6719,7 +6841,9 @@ async def create_anthropic_message(
 
             # Separate thinking from content
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
             cleaned_thinking = sanitize_tool_call_markup(
                 thinking_content, engine.tokenizer
             )
@@ -6779,7 +6903,7 @@ async def create_anthropic_message(
 @app.post("/v1/messages/count_tokens")
 async def count_anthropic_tokens(
     request: TokenCountRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """
     Count tokens in a message request.
@@ -6906,7 +7030,7 @@ def _store_response_state(
 async def create_response(
     request: ResponsesRequest,
     http_request: FastAPIRequest,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Create a response (OpenAI Responses API)."""
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
@@ -7272,7 +7396,9 @@ async def create_response(
 
             # Process output text
             raw_text = clean_special_tokens(output.text) if output.text else ""
-            thinking_content, regular_content = extract_thinking(raw_text)
+            thinking_content, regular_content = extract_thinking(
+                raw_text, truncated=output.finish_reason == "length"
+            )
 
             # Parse tool calls
             if output.tool_calls:
@@ -7750,7 +7876,9 @@ async def stream_responses_api(
 
     # Flush remaining content from parsers
     if stream_content:
-        thinking_delta, content_delta = thinking_parser.finish()
+        thinking_delta, content_delta = thinking_parser.finish(
+            truncated=last_output is not None and last_output.finish_reason == "length"
+        )
         if thinking_delta:
             if thinking_filter:
                 thinking_delta = thinking_filter.feed(thinking_delta)
@@ -7810,7 +7938,10 @@ async def stream_responses_api(
         tool_calls = _convert_parser_tool_calls(last_output.tool_calls)
         cleaned_text = ""
     elif has_tools and accumulated_text:
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -7845,7 +7976,10 @@ async def stream_responses_api(
             )
     else:
         # No tools — use raw accumulated text minus thinking.
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(
+            accumulated_text,
+            truncated=last_output is not None and last_output.finish_reason == "length",
+        )
         cleaned_text = clean_special_tokens(regular_content) if regular_content else ""
 
     recovered_thinking = (
@@ -8168,7 +8302,7 @@ async def stream_responses_api(
 @app.get("/v1/responses/{response_id}")
 async def get_response(
     response_id: str,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Retrieve a stored response."""
     data = _server_state.responses_store.get(response_id)
@@ -8180,7 +8314,7 @@ async def get_response(
 @app.delete("/v1/responses/{response_id}")
 async def delete_response(
     response_id: str,
-    _: bool = Depends(verify_api_key),
+    _: bool = Depends(verify_inference_api_key),
 ):
     """Delete a stored response."""
     if not _server_state.responses_store.delete(response_id):

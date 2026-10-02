@@ -36,6 +36,7 @@ import os
 import re
 import struct
 import threading
+import time
 from collections import namedtuple
 from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
@@ -298,6 +299,53 @@ def _shutdown_io_pool() -> None:
         pool.shutdown(wait=True)
 
 
+# Poll interval while the overlap path waits on reads (see _GpuKeepalive).
+_KEEPALIVE_PERIOD_S = 50e-6
+_KEEPALIVE_LOCAL = threading.local()
+# A decode step overlaps only when its first missing expert is still being read
+# this long after the reads were issued. Faster reads (page cache, fast internal
+# storage) keep the serial order: an idle gap this short barely lowers the GPU
+# clock, and splitting the gather in two would cost more than it hides.
+_OVERLAP_GRACE_S = 0.5e-3
+
+
+class _GpuKeepalive:
+    """Keep the GPU clocked while the calling thread waits on expert reads.
+
+    Apple GPUs lower their clock after a couple of milliseconds idle, and the
+    next burst of work then runs slower until the clock recovers. A decode
+    step's reads leave the GPU idle for that long, so the next layer's GPU
+    work pays for it; one short gather at the start of the wait does not
+    prevent it. While reads are in flight this submits a trivial kernel every
+    ``_KEEPALIVE_PERIOD_S``, at most two in flight, so the GPU never goes
+    fully idle. The kernels touch nothing the model reads. One per thread:
+    engines on different threads use different streams.
+    """
+
+    def __init__(self):
+        self._x = mx.zeros((8,), dtype=mx.float32)
+        self._inflight: list = []
+
+    def wait(self, futures) -> None:
+        """Block until ``futures`` finish, keeping the GPU busy meanwhile."""
+        while True:
+            _, pending = wait(futures, timeout=_KEEPALIVE_PERIOD_S)
+            if not pending:
+                return
+            y = self._x + 1
+            mx.async_eval(y)
+            self._inflight.append(y)
+            if len(self._inflight) > 2:
+                mx.eval(self._inflight.pop(0))
+
+
+def _gpu_keepalive() -> _GpuKeepalive:
+    ka = getattr(_KEEPALIVE_LOCAL, "ka", None)
+    if ka is None:
+        ka = _KEEPALIVE_LOCAL.ka = _GpuKeepalive()
+    return ka
+
+
 class ExpertCache:
     """Contiguous resident slots over one layer's experts, LRU eviction.
 
@@ -306,6 +354,8 @@ class ExpertCache:
     memory and adding it: keeping the source tensors referenced alongside the
     slots costs the full expert set *plus* the cache.
     """
+
+    moe_offload_cache = True  # walked by materialize_offload_state / stats
 
     def __init__(self, glu: SwitchGLU, capacity: int, disk: _GLUStoreView):
         self.n_experts = glu.gate_proj["weight"].shape[0]
@@ -409,12 +459,27 @@ class ExpertCache:
         """
         if self.warm:  # nothing can miss; skip it
             return
-        needed = set(int(e) for e in idx.reshape(-1).tolist())
+        self._ensure_ids(set(int(e) for e in idx.reshape(-1).tolist()))
+
+    def _ensure_ids(self, needed: set, on_slow_read=None) -> bool:
+        """:meth:`ensure` for a route set already read back from the device.
+
+        With ``on_slow_read`` (the decode overlap path), the call checks once,
+        at its first miss and before any slot write, whether that expert's
+        reads finish within ``_OVERLAP_GRACE_S`` of being issued. If they do
+        not, ``on_slow_read()`` runs and may dispatch GPU work; what it returns
+        is evaluated right before the first slot write, and the rest of the
+        call's reads are waited on with the GPU kept busy (see
+        :meth:`OffloadSwitchGLU._forward_overlap`). Returns whether that
+        happened.
+        """
         pool = _io_pool()
         queue = [e for e in needed if e not in self.slot_of] if pool is not None else []
         window = _io_batch()
         pending: dict[int, list] = {}
         sent = 0
+        keepalive = barrier = None
+        slow = False
 
         def prefetch(upto: int) -> None:
             nonlocal sent
@@ -434,6 +499,7 @@ class ExpertCache:
 
         try:
             prefetch(window)
+            deadline = time.perf_counter() + _OVERLAP_GRACE_S
             done = 0
             for e in needed:
                 if e in self.slot_of:
@@ -446,11 +512,24 @@ class ExpertCache:
                 if sent < len(queue) and queue[sent] == e:
                     prefetch(done + window)
                 group = pending.get(e)
+                if on_slow_read is not None:  # the first miss: nothing written yet
+                    futures = [f for _, _, _, f in group or ()]
+                    timeout = max(0.0, deadline - time.perf_counter())
+                    if futures and wait(futures, timeout=timeout).not_done:
+                        slow = True
+                        barrier = on_slow_read()
+                        keepalive = _gpu_keepalive()
+                    on_slow_read = None
                 if group is None:
                     self._install(e)
                     continue
                 # Count the current payload in the window until its writes finish.
                 prefetch(done + window)
+                if keepalive is not None:
+                    keepalive.wait([f for _, _, _, f in group])
+                if barrier is not None:
+                    mx.eval(barrier)  # right before the first slot write
+                    barrier = None
                 self._install(
                     e,
                     [(name, field, plan, f.result()) for name, field, plan, f in group],
@@ -468,6 +547,7 @@ class ExpertCache:
         # evaluating every resident tensor on every miss measured 22% slower
         # at identical peak memory. Prefill's transient is bounded by the
         # per-chunk eval in __call__, which is a different mechanism.
+        return slow
 
     def qmm(
         self, name: str, x: mx.array, slots: mx.array, sorted_indices: bool = False
@@ -491,6 +571,10 @@ class ExpertCache:
         )
 
 
+# The stock SwitchGLU sorts routes from this many on (prefill); decode is below.
+_SORT_MIN_ROUTES = 64
+
+
 class OffloadSwitchGLU(nn.Module):
     """SwitchGLU whose experts live in an :class:`ExpertCache`."""
 
@@ -498,16 +582,96 @@ class OffloadSwitchGLU(nn.Module):
         super().__init__()
         self.cache = ExpertCache(glu, capacity, disk)
         self.activation = glu.activation
+        # Fetch/compute overlap in decode: the GPU stays busy while slow
+        # reads of missing experts are pending. OMLX_MOE_OFFLOAD_OVERLAP=0
+        # keeps the serial order (read, then compute) for every step.
+        self._overlap = os.environ.get("OMLX_MOE_OFFLOAD_OVERLAP", "1") != "0"
+
+    def _glu(self, x: mx.array, slots: mx.array) -> mx.array:
+        c = self.cache
+        up = c.qmm("up_proj", x, slots)
+        gate = c.qmm("gate_proj", x, slots)
+        return c.qmm("down_proj", self.activation(up, gate), slots)
+
+    def _glu_routes(self, flat_x: mx.array, flat: list, pos: list, k: int) -> mx.array:
+        """The experts' output for the flat route positions ``pos`` only.
+
+        Each route gets its token's row and its expert's slot, the layout of
+        the expert-major prefill chunks: the same unsorted kernel as the full
+        decode gather, so every row is bit-identical to it.
+        """
+        rows = mx.take(flat_x, mx.array([p // k for p in pos], dtype=mx.int32), axis=0)
+        slots = mx.array([self.cache.slot_of[flat[p]] for p in pos], dtype=mx.int32)
+        return self._glu(mx.expand_dims(rows, (-2, -3)), slots.reshape(-1, 1))
+
+    def _forward_overlap(self, x: mx.array, indices: mx.array) -> mx.array:
+        """Decode step that keeps the GPU busy while slow reads are pending.
+
+        The serial step reads the route set back, reads the misses, then
+        computes, and the GPU idles through the read. When the first missing
+        expert arrives within ``_OVERLAP_GRACE_S`` of its reads being issued
+        (page cache, fast storage) that is the right order, and this step
+        takes it unchanged. When it does not, the GPU would idle for
+        milliseconds, and Apple GPUs lower their clock after a couple of
+        milliseconds idle, so the next layer's work runs slower too. Then the
+        resident routes' ``gather_qmm`` is dispatched while the reads
+        continue, a trivial kernel keeps the GPU clocked for the rest of the
+        wait (:class:`_GpuKeepalive`), the missing routes are gathered once
+        they are installed, and the layer's output is dispatched as soon as
+        it is built. Every route is computed once, by the same kernel as the
+        serial gather (``gather_qmm`` is per-row), so the output is
+        bit-identical. The resident gather is evaluated right before the
+        first slot write: while it still references the resident arrays a
+        write cannot happen in place and copies the whole array (2.5 ms
+        instead of 0.5 ms per expert at 2.8 MB experts).
+        """
+        c = self.cache
+        flat = indices.reshape(-1).tolist()  # the sync
+        hit = [e in c.slot_of for e in flat]  # residency before any install
+        hit_pos = [p for p, h in enumerate(hit) if h]
+        flat_x = x.reshape(-1, x.shape[-1])
+        k = indices.shape[-1]
+        y_hit = None
+
+        def on_slow_read():
+            nonlocal y_hit
+            if hit_pos:
+                y_hit = self._glu_routes(flat_x, flat, hit_pos, k)
+                mx.async_eval(y_hit)
+            return y_hit
+
+        slow = c._ensure_ids(set(flat), on_slow_read)
+        if y_hit is None:  # fast reads, or no resident route: one gather
+            out = self._glu(mx.expand_dims(x, (-2, -3)), mx.take(c.map, indices))
+            out = out.squeeze(-2)
+        else:
+            miss_pos = [p for p, h in enumerate(hit) if not h]
+            y = mx.concatenate([y_hit, self._glu_routes(flat_x, flat, miss_pos, k)])
+            back = [0] * len(flat)  # route p's row in y
+            for row, p in enumerate(hit_pos + miss_pos):
+                back[p] = row
+            out = mx.take(y, mx.array(back, dtype=mx.int32), axis=0)
+            out = out.reshape(indices.shape + (y.shape[-1],))
+        if slow:
+            mx.async_eval(out)
+        return out
 
     def _forward(self, x: mx.array, indices: mx.array) -> mx.array:
         c = self.cache
+        if (
+            self._overlap
+            and not c.warm
+            and indices.size < _SORT_MIN_ROUTES
+            and _io_pool() is not None
+        ):
+            return self._forward_overlap(x, indices)
         c.ensure(indices)
         slots = mx.take(c.map, indices)
         x = mx.expand_dims(x, (-2, -3))
         # Mirror the stock SwitchGLU's sort rule exactly (threshold and all):
         # decode calls are far below it, and forcing the sort there measured
         # slower than it saved.
-        do_sort = indices.size >= 64
+        do_sort = indices.size >= _SORT_MIN_ROUTES
         inv = None
         if do_sort:
             x, slots, inv = _gather_sort(x, slots)
@@ -550,9 +714,25 @@ class OffloadSwitchGLU(nn.Module):
         for start, end in zip(cuts[:-1], cuts[1:]):
             chunk_ids = sorted_ids[start:end]
             c.ensure(mx.array(np.unique(chunk_ids), dtype=mx.int32))
+            n_routes = end - start
+            padded_routes = n_routes
+            # GatherQMM uses sorted QMM only when B >= 16 and B / E >= 4
+            # (E = resident slots); below that, padding would change kernels.
+            if n_routes >= max(16, 4 * c.capacity):
+                # Power-of-two sizes repeat across layers, so the Metal pool
+                # reuses those buffers instead of keeping one per size.
+                padded_routes = 1 << (n_routes - 1).bit_length()
+            token_ids = order[start:end] // k
+            if padded_routes != n_routes:
+                chunk_ids = np.pad(
+                    chunk_ids, (0, padded_routes - n_routes), mode="edge"
+                )
+                token_ids = np.pad(
+                    token_ids, (0, padded_routes - n_routes), mode="edge"
+                )
             slots = mx.take(c.map, mx.array(chunk_ids, dtype=mx.int32))
             slots = slots.reshape(-1, 1)
-            t_idx = mx.array(order[start:end] // k, dtype=mx.int32)
+            t_idx = mx.array(token_ids, dtype=mx.int32)
             xe = mx.expand_dims(mx.take(flat_x, t_idx, axis=0), (-2, -3))
             inv = None
             if do_sort:
@@ -561,8 +741,8 @@ class OffloadSwitchGLU(nn.Module):
             gate = c.qmm("gate_proj", xe, slots, do_sort)
             o = c.qmm("down_proj", self.activation(up, gate), slots, do_sort)
             if do_sort:
-                o = _scatter_unsort(o, inv, (end - start, 1))
-            o = o.squeeze(-2)[:, 0, :]
+                o = _scatter_unsort(o, inv, (padded_routes, 1))
+            o = o.squeeze(-2)[:n_routes, 0, :]
             mx.eval(o)
             outs.append(o)
         out = mx.concatenate(outs, axis=0)
@@ -626,12 +806,30 @@ def _resolve_model_dir(model_path: str | Path) -> Path | None:
         return None
 
 
+def _is_mtp_path(path: str) -> bool:
+    """Module path or checkpoint tensor name under an embedded MTP draft head.
+
+    Matches ``mtp.*`` and ``*.mtp.*`` by path segment, so the wrappers and
+    admission agree on which experts stay resident.
+    """
+    return "mtp" in path.split(".")
+
+
 def _is_stock_switch_glu(obj) -> bool:
     # mlx-lm and mlx-vlm each define their own SwitchGLU class; match by
     # name + shape of the contract, not identity, so the VLM-served path
     # (the default for Gemma 4 checkpoints) is covered. OffloadSwitchGLU
     # has a different name, so re-wrapping is naturally excluded.
-    return type(obj).__name__ == "SwitchGLU" and hasattr(obj, "activation")
+    # The GLM DSA package's SwitchGLU (fused gate/up, native weighted sum)
+    # has its own adapter; see omlx.patches.glm_moe_dsa.moe_offload. The
+    # DeepSeek V4 package's SwitchGLU (native block/pair kernels), shared by
+    # glm5_next, has its own too; see omlx.patches.deepseek_v4.moe_offload.
+    return (
+        type(obj).__name__ == "SwitchGLU"
+        and hasattr(obj, "activation")
+        and type(obj).__module__ != "omlx.patches.glm_moe_dsa.switch_layers"
+        and type(obj).__module__ != "omlx.patches.deepseek_v4.switch_layers"
+    )
 
 
 def _is_quantized_switch_linear(lin) -> bool:
@@ -665,6 +863,17 @@ def _iter_switch_glus(model):
                 yield from walk(obj, i, v, f"{path}.{i}")
 
     yield from walk(None, None, model, "")
+
+
+def _qwen35_checkpoint_prefix(store, path):
+    # Qwen's loader adds language_model. to text-only checkpoint keys.
+    if path.startswith("language_model.model.layers.") and not store.has(
+        path + ".gate_proj.weight"
+    ):
+        flat = path.removeprefix("language_model.")
+        if store.has(flat + ".gate_proj.weight"):
+            return flat
+    return path
 
 
 def _resolve_store_view(
@@ -731,7 +940,11 @@ def _resolve_store_view(
 
 
 def apply_moe_expert_offload(
-    model, model_path: str | Path, resident_fraction: float = 0.25
+    model,
+    model_path: str | Path,
+    resident_fraction: float = 0.25,
+    *,
+    mtp_resident: bool = False,
 ) -> int:
     """Replace covered SwitchGLU instances with offloaded ones.
 
@@ -739,6 +952,12 @@ def apply_moe_expert_offload(
     ``OMLX_MOE_EXPERT_OFFLOAD=0``, the model has no stock SwitchGLU, or the
     checkpoint does not cover them). Must run before lazy weights are
     materialized for the memory saving to exist.
+
+    ``mtp_resident`` keeps the embedded MTP draft head's experts resident
+    (glm5_next Lightning MTP + offload; see
+    ``omlx.patches.deepseek_v4.moe_offload``; qwen4_exp's native head under
+    ``mtp.*`` is skipped by the generic traversal below). Other families
+    reject the combination at validation.
     """
     if os.environ.get("OMLX_MOE_EXPERT_OFFLOAD", "1") == "0":
         return 0
@@ -746,15 +965,42 @@ def apply_moe_expert_offload(
     if model_dir is None:
         return 0
     minimum = _minimum_experts(model_dir)
+    config_path = Path(model_dir) / "config.json"
+    kind = (
+        json.loads(config_path.read_text()).get("model_type")
+        if config_path.exists()
+        else None
+    )
     store = CheckpointExpertStore(model_dir)
     if not store:
         logger.warning("moe expert offload: no safetensors under %s", model_dir)
         return 0
 
-    wrapped = 0
+    # GLM DSA blocks have their own adapter (fused gate/up, native weighted
+    # sum); it shares this store format and the same wrap-before-materialize
+    # contract, so the engine sees one count. DeepSeek V4 / glm5_next blocks
+    # (native block kernels, split projections) follow the same pattern; see
+    # omlx.patches.deepseek_v4.moe_offload.
+    from .glm_moe_dsa.moe_offload import apply_glm_moe_expert_offload
+
+    wrapped = apply_glm_moe_expert_offload(model, model_dir, resident_fraction)
+    from .deepseek_v4.moe_offload import apply_deepseek_v4_moe_expert_offload
+
+    wrapped += apply_deepseek_v4_moe_expert_offload(
+        model, model_dir, resident_fraction, mtp_resident=mtp_resident
+    )
     total_bytes = resident_bytes = 0
     for parent, key, glu, path in list(_iter_switch_glus(model)):
-        view, reason = _resolve_store_view(glu, store, path)
+        if mtp_resident and _is_mtp_path(path):
+            # Lightning MTP drafts from this head every step; streaming its
+            # experts would put SSD reads on the draft path. Admission counts
+            # it as resident (estimate_offload_admission_bytes mtp_resident).
+            logger.info("moe expert offload: keeping MTP head resident: %s", path)
+            continue
+        checkpoint_path = (
+            _qwen35_checkpoint_prefix(store, path) if kind == "qwen3_5_moe" else path
+        )
+        view, reason = _resolve_store_view(glu, store, checkpoint_path)
         if view is None:
             logger.info("moe expert offload: skipping %s (%s)", path, reason)
             continue
@@ -782,7 +1028,7 @@ def apply_moe_expert_offload(
         # (same reasoning as the gate/up fusion patch, #2304).
         _sync_and_clear_cache()
 
-    if wrapped:
+    if total_bytes:
         logger.info(
             "moe expert offload: wrapped %d layers at %.1f%% residency "
             "(expert tables: %.2f GB total, %.2f GB resident)",
@@ -795,7 +1041,11 @@ def apply_moe_expert_offload(
 
 
 def estimate_offload_admission_bytes(
-    model_path: str | Path, full_size: int, resident_fraction: float = 0.25
+    model_path: str | Path,
+    full_size: int,
+    resident_fraction: float = 0.25,
+    *,
+    mtp_resident: bool = False,
 ) -> int:
     """Admission-time size estimate with offload active.
 
@@ -821,8 +1071,14 @@ def estimate_offload_admission_bytes(
         config_path = Path(model_dir) / "config.json"
         if config_path.exists():
             kind = json.loads(config_path.read_text()).get("model_type", "")
-            if kind.startswith("deepseek_v4") or kind in ("glm5_next", "glm_moe_dsa"):
+            if kind == "deepseek_v41":
+                # V4.1 admission is owned by its own adapter's estimator.
                 return full_size
+            if kind == "qwen3_5_moe":
+                from .moe_offload_compat import moe_offload_compatibility
+
+                if not moe_offload_compatibility(model_dir)[0]:
+                    return full_size
         # stacked: container -> {"bytes", "fields": {(proj, field)}, "e": set}
         # per-expert: container -> {"bytes", "per_e": {idx: {(proj, field)}}}
         # Field completeness is tracked PER EXPERT, not container-wide: the
@@ -839,6 +1095,12 @@ def estimate_offload_admission_bytes(
                 header = json.loads(f.read(header_len))
             for name, spec in header.items():
                 if name == "__metadata__":
+                    continue
+                if mtp_resident and _is_mtp_path(name):
+                    # The draft head stays resident (glm5_next / qwen4_exp
+                    # Lightning MTP + offload): its slab must not be discounted
+                    # here, or admission overcommits by exactly the bytes the
+                    # adapter refuses to offload.
                     continue
                 b0, b1 = spec["data_offsets"]
                 m = _PER_EXPERT_PROJ_RE.match(name)
@@ -911,9 +1173,9 @@ def materialize_offload_state(model) -> int:
         if id(obj) in seen:
             continue
         seen.add(id(obj))
-        if isinstance(obj, OffloadSwitchGLU):
+        cache = getattr(obj, "cache", None)
+        if getattr(cache, "moe_offload_cache", False):
             layers += 1
-            cache = obj.cache
             arrays.append(cache.map)
             for triple in cache.resident.values():
                 arrays.extend(a for a in triple if a is not None)
@@ -937,9 +1199,10 @@ def moe_offload_stats(model) -> dict:
         if id(obj) in seen:
             continue
         seen.add(id(obj))
-        if isinstance(obj, OffloadSwitchGLU):
-            hits += obj.cache.hits
-            misses += obj.cache.misses
+        cache = getattr(obj, "cache", None)
+        if getattr(cache, "moe_offload_cache", False):
+            hits += cache.hits
+            misses += cache.misses
             layers += 1
             continue
         if isinstance(obj, dict):

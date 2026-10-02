@@ -335,7 +335,7 @@ def prompt_opens_thinking(
     return True, think_tag
 
 
-def extract_thinking(text: str) -> Tuple[str, str]:
+def extract_thinking(text: str, *, truncated: bool = False) -> Tuple[str, str]:
     """Extract thinking and content from complete text.
 
     Guarded literal tags (see :data:`LITERAL_TAG_GUARD`) are not treated as
@@ -363,6 +363,8 @@ def _extract_thinking_impl(text: str) -> Tuple[str, str]:
       fallback the entire body would be classified as thinking and the
       visible answer would be empty.
 
+    With ``truncated=True``, unfinished thinking stays in the thinking channel.
+
     Tag-free text is always classified as content. Mirrors
     ``ThinkingParser.finish()`` recovery semantics (`_content_emitted`
     fallback): when the model emits no thinking markers, surface the body
@@ -370,6 +372,7 @@ def _extract_thinking_impl(text: str) -> Tuple[str, str]:
 
     Args:
         text: Complete model output text.
+        truncated: Keep unfinished thinking in its channel on length termination.
 
     Returns:
         Tuple of (thinking_content, regular_content).
@@ -394,6 +397,11 @@ def _extract_thinking_impl(text: str) -> Tuple[str, str]:
             break
         thinking_parts.append(match.group(1))
         remaining = remaining[:match.start()] + remaining[match.end():]
+
+    if truncated and _OPEN_TAG in remaining:
+        before, after = remaining.split(_OPEN_TAG, 1)
+        thinking_parts.append(after)
+        remaining = before
 
     if thinking_parts:
         thinking = "\n".join(thinking_parts).strip()
@@ -552,15 +560,12 @@ class ThinkingParser:
             self._content_emitted = True
         return (thinking_delta, content_delta)
 
-    def finish(self) -> Tuple[str, str]:
+    def finish(self, *, truncated: bool = False) -> Tuple[str, str]:
         """Flush any remaining buffered content.
 
         Should be called when the stream is complete to emit any
         buffered characters that were waiting for potential tag completion.
-        Also recovers from malformed thinking — when the model never
-        emitted ``</think>`` and no content was ever produced, returns
-        the accumulated thinking text as content so the client surfaces
-        a non-empty answer body.
+        Unless truncated, recover an unclosed thinking block as content when no answer was emitted.
 
         Returns:
             Tuple of (thinking_text, content_text) from remaining buffer
@@ -577,7 +582,8 @@ class ThinkingParser:
         # the same text twice — once in the thinking panel, once as the
         # answer. UX trade-off documented in the chat template plan.
         if (
-            self._in_thinking
+            not truncated
+            and self._in_thinking
             and not self._close_seen
             and not self._content_emitted
             and self._thinking_accumulated
