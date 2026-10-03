@@ -24,6 +24,7 @@ from unittest.mock import MagicMock, patch
 
 import mlx.core as mx
 import pytest
+from mlx_lm.generate import StopSequences
 
 import omlx.scheduler as scheduler_mod
 from omlx.api.thinking import ThinkingBudgetProcessor
@@ -475,7 +476,7 @@ class TestRouteGate:
             [SimpleNamespace(state=mx.zeros(1), offset=3)],
             [42],
             _argmax_sampler,
-            object(),
+            StopSequences([[2]]),
             logits_processors=[proc],
         )
 
@@ -667,9 +668,8 @@ async def test_contract_error_isolated_in_engine_loop(
             request,
             [],
             _argmax_sampler,
-            None,
+            StopSequences([[mock_tokenizer.eos_token_id]]),
             2,
-            stop_token_ids={mock_tokenizer.eos_token_id},
         )
         collector = RequestOutputCollector()
         engine._output_collectors[request_id] = collector

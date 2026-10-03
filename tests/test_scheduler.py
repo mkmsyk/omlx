@@ -25,6 +25,7 @@ from unittest.mock import MagicMock, call, patch
 
 import mlx.core as mx
 import pytest
+from mlx_lm.generate import StopSequences
 from mlx_lm.models.cache import CacheList, KVCache
 
 import omlx.scheduler as scheduler_module
@@ -2575,7 +2576,7 @@ class TestSchedulerSuppressTokens:
                 cache,
                 [1],
                 sampler,
-                state_machine=object(),
+                state_machine=StopSequences([[2]]),
             )
 
         assert uid is not None

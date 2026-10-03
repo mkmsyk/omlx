@@ -225,14 +225,20 @@ class _VLMMTPDecodeState:
     request: Request
     prompt_cache: list[Any]
     sampler: Callable[[Any], Any]
+    # The request's StopSequences from _build_state_machine: EOS, the request's
+    # stop_token_ids and its tokenized stop strings. The decode loop advances a
+    # matcher over it, so stop strings end vlm_mtp requests exactly as they end
+    # BatchGenerator requests. A separate EOS-only set used to stand in for it
+    # and let stop strings (e.g. Gemma 4's single-token "<channel|>") run on.
     state_machine: Any
     max_tokens: int
-    # Plain stop-token set (EOS + request-specific) for direct membership
-    # check; mlx-lm's StopSequences doesn't expose a "did the last
-    # token finish" helper, so we keep a copy.
-    stop_token_ids: set[int] = field(default_factory=set)
     emitted: int = 0
     finished: bool = False
+    stop_matcher: Any = None
+
+    def __post_init__(self) -> None:
+        if self.stop_matcher is None and self.state_machine is not None:
+            self.stop_matcher = self.state_machine.matcher()
 
 
 @dataclass
@@ -10026,7 +10032,9 @@ class Scheduler:
             hidden = hidden[:, -1:, :]
 
         # Combine base stop tokens (EOS, Harmony, generation_config) with
-        # request-specific stop_token_ids — same shape as _build_state_machine.
+        # request-specific stop_token_ids so the generator stops drafting at
+        # them. Ending the request is decided by the request's StopSequences
+        # (state_machine), which also carries the tokenized stop strings.
         eos_ids: set[int] = self._get_stop_tokens()
         if request.sampling_params.stop_token_ids:
             eos_ids.update(request.sampling_params.stop_token_ids)
@@ -10070,7 +10078,6 @@ class Scheduler:
             sampler=mtp_sampler,
             state_machine=state_machine,
             max_tokens=_remaining_generation_tokens(request),
-            stop_token_ids=set(eos_ids),
         )
         logger.info(
             "vlm_mtp decode started: request=%s uid=%d block_size=%s",
@@ -10191,7 +10198,7 @@ class Scheduler:
 
             state.emitted += 1
             finish_reason: str | None = None
-            if state.stop_token_ids and token in state.stop_token_ids:
+            if state.stop_matcher is not None and state.stop_matcher.advance(token):
                 finish_reason = "stop"
             elif state.emitted >= state.max_tokens:
                 finish_reason = "length"
