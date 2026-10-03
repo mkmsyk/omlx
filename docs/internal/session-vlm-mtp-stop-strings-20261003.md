@@ -25,6 +25,21 @@ BatchGenerator はそれで終端する。`_route_to_vlm_mtp` もその `StopSeq
 - 試験: `tests/test_vlm_mtp_stop_sequences.py`（1トークンの stop、複数トークンの stop の最後のトークン、EOS と生成上限）。
   `state_machine` に `object()`・`None` を渡していた試験2件と1件を、本物の `StopSequences` に揃えた。
 
+## 配備の試験で落ちた子 process の待ち時間（別 commit）
+
+`omlx-update prepare --current`（`0.7.0-ab80d9d`）の `pytest -m "not slow"` は 16,843 件成功・5件失敗で止まった（33分。前回 `78ac54b`
+は全件成功で23分）。5件はすべて子 process を固定の秒数で待つ試験の時間切れで、修正とは別の箇所だった。
+
+| 試験 | 待ち方 | 実際 |
+|---|---|---|
+| `test_engine_teardown.py::test_watchdog_terminates_stalled_or_over_budget_process`（2件） | `subprocess.run(timeout=30)` | 子の `import omlx.engine_core` だけで 31.4 秒（負荷平均 94〜160） |
+| `test_cluster_cli.py::test_cluster_status_json_is_runnable`・`..._pipeline_smoke_json_is_runnable` | CLI 全体を 30・40 秒、pipeline-smoke 内部の集団通信 30 秒 | omlx の読み込みで枠を使い切る |
+| `test_eval_worker_pool.py::test_real_code_scoring_subprocess_cleanup` | 採点の子 process が目印を書くまで 2 秒 | Python の起動で超える |
+
+どの枠も確かめたい性質の判定ではなく、止まったままを防ぐ上限だった（watchdog が壊れていれば子は10秒の sleep の後に
+正常終了して判定で落ちる）。上限を `tests/subprocess_limits.py` の `SUBPROCESS_HANG_GUARD_SEC`（600秒）にそろえ、CLI の
+worker-smoke・pipeline-smoke の内部の期限はその半分を渡す。負荷平均 147 で対象 58 件が成功した。
+
 ## 検証
 
 - `tests/test_vlm_mtp_stop_sequences.py`・`test_vlm_mtp_thinking_budget.py`・`test_scheduler.py`・`test_vlm_mtp_chunked_prefill.py`

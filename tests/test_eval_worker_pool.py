@@ -16,6 +16,7 @@ from omlx.eval.base import BaseBenchmark
 from omlx.eval.humaneval import HumanEvalBenchmark
 from omlx.eval.livecodebench import LiveCodeBenchBenchmark
 from omlx.eval.mbpp import MBPPBenchmark
+from tests.subprocess_limits import SUBPROCESS_HANG_GUARD_SEC
 
 WAIT = 1.0
 
@@ -448,7 +449,9 @@ async def test_real_code_scoring_subprocess_cleanup(cls, cancel, monkeypatch, tm
         try:
             await engine.wait_started("q0", "q1")
             engine.release("q0")
-            await asyncio.wait_for(wait_for_file(), 2)
+            # The scoring child is a fresh Python process; its start-up scales
+            # with host load, so this wait is a hang guard only.
+            await asyncio.wait_for(wait_for_file(), SUBPROCESS_HANG_GUARD_SEC)
             pid = int(marker.read_text())
             os.kill(pid, 0)
             if cancel:
@@ -462,9 +465,9 @@ async def test_real_code_scoring_subprocess_cleanup(cls, cancel, monkeypatch, tm
             release.touch()
         if cancel:
             with pytest.raises(asyncio.CancelledError):
-                await asyncio.wait_for(run, 2)
+                await asyncio.wait_for(run, SUBPROCESS_HANG_GUARD_SEC)
         else:
-            result = await asyncio.wait_for(run, 2)
+            result = await asyncio.wait_for(run, SUBPROCESS_HANG_GUARD_SEC)
             assert result.correct_count == 2
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)

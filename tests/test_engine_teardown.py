@@ -21,6 +21,7 @@ from omlx.engine.batched import BatchedEngine
 from omlx.engine.vlm import VLMBatchedEngine
 from omlx.engine_core import EngineCore, _EngineTeardown
 from omlx.model_registry import ModelOwnershipError, get_registry
+from tests.subprocess_limits import SUBPROCESS_HANG_GUARD_SEC
 
 
 def budget():
@@ -184,9 +185,14 @@ with _EngineTeardown("subprocess", 0.2) as guard:
         guard.set_phase("primary_ssd", time.monotonic)
     time.sleep(10)
 """
-    # Cold engine imports can exceed five seconds before the watchdog starts.
+    # A broken watchdog lets the child exit 0 after its 10 s sleep, so the wait
+    # limit only guards against a hang; the cold engine import that precedes
+    # the watchdog scales with host load.
     result = subprocess.run(
-        [sys.executable, "-c", code], capture_output=True, text=True, timeout=30
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=SUBPROCESS_HANG_GUARD_SEC,
     )
     assert result.returncode == 70
     if progressing:

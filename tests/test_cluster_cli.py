@@ -1,9 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
-"""End-to-end CLI tests for the runnable cluster prototype."""
+"""End-to-end CLI tests for the runnable cluster prototype.
+
+Each test runs the CLI in a child process; the wait limit is a hang guard only
+(see ``tests/subprocess_limits.py``), because importing omlx scales with host load.
+"""
 
 import json
 import subprocess
 import sys
+
+from tests.subprocess_limits import SUBPROCESS_HANG_GUARD_SEC
+
+# worker-smoke and pipeline-smoke have their own deadlines (worker start-up,
+# collective); keep them inside the outer guard for the same reason.
+CLI_INTERNAL_DEADLINE_SEC = SUBPROCESS_HANG_GUARD_SEC // 2
 
 
 def test_cluster_help_is_exposed():
@@ -11,7 +21,7 @@ def test_cluster_help_is_exposed():
         [sys.executable, "-m", "omlx.cli", "cluster", "--help"],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=SUBPROCESS_HANG_GUARD_SEC,
     )
     assert result.returncode == 0
     assert "status" in result.stdout
@@ -26,7 +36,7 @@ def test_cluster_status_json_is_runnable():
         [sys.executable, "-m", "omlx.cli", "cluster", "status", "--json"],
         capture_output=True,
         text=True,
-        timeout=30,
+        timeout=SUBPROCESS_HANG_GUARD_SEC,
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
@@ -44,10 +54,12 @@ def test_cluster_worker_smoke_json_is_runnable():
             "cluster",
             "worker-smoke",
             "--json",
+            "--timeout",
+            str(CLI_INTERNAL_DEADLINE_SEC),
         ],
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=SUBPROCESS_HANG_GUARD_SEC,
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
@@ -66,10 +78,12 @@ def test_cluster_pipeline_smoke_json_is_runnable():
             "cluster",
             "pipeline-smoke",
             "--json",
+            "--timeout",
+            str(CLI_INTERNAL_DEADLINE_SEC),
         ],
         capture_output=True,
         text=True,
-        timeout=40,
+        timeout=SUBPROCESS_HANG_GUARD_SEC,
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
@@ -91,7 +105,7 @@ def test_cluster_status_rejects_hostname_route_target():
         ],
         capture_output=True,
         text=True,
-        timeout=10,
+        timeout=SUBPROCESS_HANG_GUARD_SEC,
     )
     assert result.returncode == 2
     assert "IPv4 or IPv6" in result.stderr
@@ -117,7 +131,7 @@ def test_cluster_unequal_plan_json_is_runnable():
         ],
         capture_output=True,
         text=True,
-        timeout=15,
+        timeout=SUBPROCESS_HANG_GUARD_SEC,
     )
     assert result.returncode == 0, result.stderr
     payload = json.loads(result.stdout)
