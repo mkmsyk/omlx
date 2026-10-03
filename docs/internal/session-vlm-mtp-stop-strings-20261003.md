@@ -44,7 +44,13 @@ worker-smoke・pipeline-smoke の内部の期限はその半分を渡す。負�
 
 - `tests/test_vlm_mtp_stop_sequences.py`・`test_vlm_mtp_thinking_budget.py`・`test_scheduler.py`・`test_vlm_mtp_chunked_prefill.py`
   の 423 件成功（fork の作業ツリー、稼働 release の venv）。全体の `pytest -m "not slow"` は `omlx-update prepare` が流す。
-- 配備（`omlx-update prepare --current` → `apply` → `verify` → `finalize`）と実機の確認は下に追記する。
+- 配備: `omlx-update prepare --current` で release `0.7.0-b88fa65`（全体の `pytest -m "not slow"` 成功）→ `apply`
+  （10:48:29Z に 26B を退避、中断した推論 0 件、10:48:46Z 完了）→ `verify`（推論チケット `r-cead84e1-7334-4f05-9668-79f48689c381`、
+  26B・sidekick）→ `finalize`（fork `main` = `b88fa657`）。試験で止まった `0.7.0-ab80d9d` の worktree・ブランチ・venv は撤去した。
+- 実機（19:52〜19:53 JST、管制経由・特急、Sidekicks の `resume_completion`）: 思考の途中を渡して `stop: ["<channel|>"]` で続けさせた
+  ①が、26B・31B とも vlm_mtp（`vlm_mtp decode started` → `finish=stop`）で思考だけを返して止まった（26B 72 トークン・emitted 73、
+  31B 57 トークン・emitted 58。最後の1つが `<channel|>`）。②は閉じた思考の後ろから答えの1文（13 トークン）を書いた。
+  修正前は同じ経路で①が答えまで書き切っていた。
 
 ## 残 TODO
 
