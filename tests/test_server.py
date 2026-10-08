@@ -2,14 +2,18 @@
 """Tests for omlx.server module - sampling parameter resolution and exception handlers."""
 
 import asyncio
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+import omlx.api.body_limit as body_limit
 import omlx.server as srv
+from omlx.api.body_limit import RequestBodySizeLimitMiddleware
+from omlx.engine.decision import DecisionEngine
 from omlx.engine_pool import EngineEntry
 from omlx.exceptions import (
     InvalidRequestError,
@@ -530,6 +534,41 @@ class TestExceptionHandlers:
         data = response.json()
         assert "detail" in data
 
+    @pytest.mark.parametrize(
+        ("path", "body", "param"),
+        [
+            (
+                "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "hi \ud83d"}]},
+                "messages[0].content",
+            ),
+            ("/v1/completions", {"prompt": "hi \ud83d"}, "prompt"),
+            (
+                "/v1/messages",
+                {
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hi \ud83d"}],
+                },
+                "messages[0].content",
+            ),
+            (
+                "/v1/messages/count_tokens",
+                {"messages": [{"role": "user", "content": "hi \ud83d"}]},
+                "messages[0].content",
+            ),
+            ("/v1/responses", {"input": "hi \ud83d"}, "input"),
+            ("/tokenize", {"prompt": "hi \ud83d"}, "prompt"),
+        ],
+    )
+    def test_lone_surrogate_returns_400(self, client, path, body, param):
+        response = client.post(
+            path,
+            content=json.dumps({"model": "m", **body}),
+            headers={"content-type": "application/json"},
+        )
+        assert response.status_code == 400
+        assert response.json()["error"]["param"] == param
+
     def test_non_api_validation_error_with_value_error_ctx_returns_422(self):
         """A ValueError-raising validator on a non-/v1/ route must 422, not 500.
 
@@ -758,6 +797,15 @@ class TestGetEngineLLMTypeValidation:
         with pytest.raises(HTTPException) as exc_info:
             await get_engine("jina-reranker", EngineType.LLM)
         assert exc_info.value.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_llm_rejects_decision_engine_with_endpoint_hint(self):
+        self._pool_returning(MagicMock(spec=DecisionEngine))
+
+        with pytest.raises(HTTPException) as exc_info:
+            await get_engine("clef-flash-4bit", EngineType.LLM)
+        assert exc_info.value.status_code == 400
+        assert "/v1/systemone" in str(exc_info.value.detail)
 
     @pytest.mark.asyncio
     async def test_llm_accepts_llm_engine(self):
@@ -1164,3 +1212,111 @@ def test_control_reclaims_pooled_memory_through_the_enforcer(monkeypatch):
     monkeypatch.setattr(srv._server_state, "process_memory_enforcer", None)
     assert asyncio.run(srv.reclaim_pooled_memory(True)) == {
         "ok": False, "skipped": "memory_enforcer_disabled"}
+
+
+@pytest.mark.parametrize(
+    "model_type, thinking_type, expected",
+    [
+        (
+            "minimax_m3",
+            "adaptive",
+            {"enable_thinking": True, "thinking_mode": "adaptive"},
+        ),
+        ("minimax_m3", "enabled", {"enable_thinking": True}),
+        ("qwen3_5", "adaptive", {"enable_thinking": True}),
+    ],
+)
+def test_anthropic_adaptive_thinking_reaches_minimax_m3_template(
+    monkeypatch, model_type, thinking_type, expected
+):
+    engine = MagicMock()
+    engine.model_type = model_type
+    engine.is_diffusion_model = False
+    engine.tokenizer = None
+    engine.preflight_chat = AsyncMock(
+        side_effect=HTTPException(status_code=418, detail="Kwargs captured")
+    )
+    engine.start = AsyncMock()
+    engine.count_chat_tokens.return_value = 128
+    pool = MagicMock()
+    pool.preload_pinned_models = AsyncMock()
+    pool.check_ttl_expirations = AsyncMock()
+    pool.shutdown = AsyncMock()
+    pool.get_entry.return_value = SimpleNamespace(
+        config_model_type=model_type, preserve_thinking_default=None
+    )
+    monkeypatch.setattr(srv._server_state, "engine_pool", pool)
+    monkeypatch.setattr(srv, "get_engine_for_model", AsyncMock(return_value=engine))
+    monkeypatch.setattr(srv, "resolve_model_id", lambda name: name)
+    monkeypatch.setattr(srv, "validate_context_window", lambda *a, **k: None)
+    monkeypatch.setattr(srv, "get_model_settings_for_request", lambda name: None)
+    monkeypatch.setitem(
+        srv.app.dependency_overrides, srv.verify_inference_api_key, lambda: True
+    )
+    with TestClient(srv.app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "test-model",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "thinking": {"type": thinking_type},
+            },
+        )
+    assert response.status_code == 418, response.text
+    assert engine.preflight_chat.call_args.kwargs["chat_template_kwargs"] == expected
+
+
+class TestRequestBodySizeLimit:
+    @pytest.fixture
+    def client(self):
+        small = FastAPI()
+        small.add_middleware(RequestBodySizeLimitMiddleware, max_bytes=1024)
+
+        @small.post("/echo")
+        async def echo(payload: dict):
+            return {"keys": len(payload)}
+
+        return TestClient(small)
+
+    def test_content_length_over_limit_is_rejected(self, client):
+        response = client.post(
+            "/echo", content=b"x" * 4096, headers={"content-type": "application/json"}
+        )
+        assert response.status_code == 413
+        assert response.json()["error"]["type"] == "request_too_large"
+
+    def test_content_length_under_limit_reaches_handler(self, client):
+        response = client.post("/echo", json={"a": 1})
+        assert response.status_code == 200
+        assert response.json() == {"keys": 1}
+
+    def test_chunked_body_stops_at_the_limit(self):
+        chunks = [b"x" * 40 for _ in range(5)]
+        seen = []
+
+        async def receive():
+            body = chunks.pop(0)
+            return {"type": "http.request", "body": body, "more_body": bool(chunks)}
+
+        async def inner_app(scope, receive, send):
+            total = 0
+            while True:
+                message = await receive()
+                if message["type"] == "http.disconnect":
+                    break
+                total += len(message["body"])
+                if not message["more_body"]:
+                    break
+            seen.append(total)
+
+        middleware = RequestBodySizeLimitMiddleware(inner_app, max_bytes=64)
+        scope = {"type": "http", "method": "POST", "path": "/echo", "headers": []}
+        asyncio.run(middleware(scope, receive, None))
+        assert seen == [40]  # The chunk that crosses the limit is dropped.
+
+    def test_limit_follows_raised_upload_limits(self, monkeypatch):
+        settings = GlobalSettings()
+        settings.server.max_audio_upload_size = "1GB"
+        monkeypatch.setattr(body_limit, "get_settings", lambda: settings)
+        assert body_limit._resolve_limit() > 1024**3
