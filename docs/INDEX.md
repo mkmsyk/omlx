@@ -23,6 +23,7 @@
 | [oMLX人間sessionのPassport一元化](internal/session-passport-auth-20260912.md) | 管理画面とネイティブアプリの認証経路変更 |
 | [Passport Cookie更新の統一](internal/session-passport-cookie-renewal-20260913.md) | Passportのrolling expiryを管理面Cookieへ共通middlewareで再中継 |
 | [oMLX upstream土台更新](internal/session-upstream-foundation-20260918.md) | upstream統合、依存更新、native kernel再ビルド、全体テスト |
+| [oMLX 上流main b75060e統合](internal/session-upstream-main-b75060e-20261008.md) | v0.7.0以降の未リリース140 commitの統合、競合6ファイルの解消、配備結果 |
 | [oMLX upstream v0.7.0統合](internal/session-upstream-v0.7.0-20261002.md) | v0.7.0の統合で競合した9ファイルの解消方針、自動統合で壊れた2点、配備結果 |
 | [Gemma 4のツール前本文によるthought漏れ](internal/session-gemma4-preamble-turn-20260926.md) | tool_calls付き本文がターンを閉じ、生成が`thought`平文で始まる原因の実測と変換層での修正 |
 | [Gemma 4 Lightning MTPの複数要求対応](internal/session-gemma-batch-mtp-20260926.md) | 共有検証・行別巻き戻し・行別下書き区間の実装、回転cache取り消しと近似attention判定の潜在不具合修正 |
