@@ -84,7 +84,7 @@ def _krisis_credential_headers() -> dict[str, str]:
         return {}
     try:
         token = Path(path).read_text(encoding="utf-8").strip()
-    except OSError:
+    except FileNotFoundError:  # 未発行だけを「付けない」とし、読めない理由は隠さない
         return {}
     return {"Authorization": f"Bearer {token}"} if token else {}
 
