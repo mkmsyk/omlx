@@ -72,6 +72,23 @@ from .utils.proc_memory import get_phys_footprint
 logger = logging.getLogger(__name__)
 
 
+def _krisis_credential_headers() -> dict[str, str]:
+    """Krisis の主体 runtime の資格（Krisis の交通整理の再設計 段階2）。
+
+    Krisis が起動時に ``KRISIS_CREDENTIAL_FILE`` で資格のファイルを渡す。要求ごとに読むので、
+    差し替えに再起動は要らない。渡されていない・未発行なら何も付けない（段階2の Krisis は
+    照合を記録するだけで、資格の有無で断らない）。値はログへ出さない。
+    """
+    path = os.environ.get("KRISIS_CREDENTIAL_FILE")
+    if not path:
+        return {}
+    try:
+        token = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return {}
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def _touch_gpu() -> None:
     """Run one trivial kernel so the GPU stays out of its idle power state.
 
@@ -2685,7 +2702,7 @@ class EnginePool:
                     request = urllib.request.Request(
                         control_url.rstrip("/") + "/control/prefill/relieve",
                         data=json.dumps(payload).encode("utf-8"), method="POST",
-                        headers={"Content-Type": "application/json"})
+                        headers={"Content-Type": "application/json", **_krisis_credential_headers()})
                     with urllib.request.urlopen(request, timeout=60) as response:
                         result = json.load(response)
                     if result.get("ok") is not True or not isinstance(result.get("evicted"), list):

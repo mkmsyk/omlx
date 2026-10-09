@@ -2768,6 +2768,28 @@ class TestEnginePoolPrefillEviction:
         pool._find_lru_prefill_eviction_victim.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_managed_prefill_sends_the_runtime_credential_krisis_passed(self, tmp_path):
+        pool = _make_pool(ceiling=0)
+        pool._entries = {"idle": self._entry("idle", 60), "target": self._entry("target", 30)}
+        pool._current_model_memory = 90
+        token = tmp_path / "runtime.token"
+        token.write_text("a" * 64 + "\n", encoding="utf-8")
+        seen = []
+        def control(request, **kwargs):
+            seen.append(request.get_header("Authorization"))
+            pool._current_model_memory = 30
+            return io.BytesIO(b'{"ok": true, "evicted": ["idle"]}')
+        request = PrefillEvictionRequest(request_id="r", model_id="target", current_bytes=90,
+            target_cap_bytes=80, predicted_transient_bytes=10, requested_tokens=10, reason="test")
+        with patch.dict(os.environ, {"KRISIS_CONTROL_URL": "http://control", "KRISIS_RUNTIME_NAME": "mlx",
+                                     "KRISIS_CREDENTIAL_FILE": str(token)}), \
+                patch("omlx.engine_pool.urllib.request.urlopen", side_effect=control), \
+                patch("omlx.engine_pool.mx.get_active_memory", return_value=0), \
+                patch("omlx.engine_pool.get_phys_footprint", return_value=0):
+            assert await pool._evict_idle_lru_for_prefill("target", request)
+        assert seen == ["Bearer " + "a" * 64]
+
+    @pytest.mark.asyncio
     async def test_managed_prefill_control_failure_never_evicts_locally(self):
         pool = _make_pool(ceiling=0)
         pool._current_model_memory = 90

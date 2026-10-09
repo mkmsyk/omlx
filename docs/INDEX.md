@@ -13,6 +13,7 @@
 
 ## 内部作業ログ
 
+| [session-krisis-runtime-credential-20261009.md](internal/session-krisis-runtime-credential-20261009.md) | 管制への退避要求（`/control/prefill/relieve`）に、Krisis が渡す主体 runtime の資格を付ける（Krisis の交通整理 段階2） |
 | [session-vlm-mtp-stop-strings-20261003.md](internal/session-vlm-mtp-stop-strings-20261003.md) | vlm_mtp の要求が stop の文字列（Gemma 4 の `<channel|>` など）で止まらなかった不具合を、要求の StopSequences で終端する形に直した |
 | [session-control-pool-reclaim-20260927.md](internal/session-control-pool-reclaim-20260927.md) | 管制からのバッファプール返却要求と、SCRAM中の条件付き回収の500修正 |
 | [session-structured-translation-20260919.md](internal/session-structured-translation-20260919.md) | TranslateGemma structured content保持の実装判断と検証 |
